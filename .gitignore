@@ -1,0 +1,21 @@
+/target
+/dist
+frontend/node_modules/
+frontend/dist/
+
+# Local runtime data if the app is ever pointed at the repo directory.
+inventory.json
+inventory.json.tmp
+inventory.json.old
+backups/
+exports/
+outbound_notes/
+
+# Local editor / OS files.
+.idea/
+.vscode/
+*.log
+*.tmp
+*.bak
+Thumbs.db
+.DS_Store
