@@ -1,4 +1,4 @@
-import type { AppData, Order, Product, ReturnRecord } from './types'
+import type { AppData, Invoice, Order, Product, ReturnRecord } from './types'
 
 export const PRODUCT_HEADERS = [
   '产品名称',
@@ -12,26 +12,40 @@ export const PRODUCT_HEADERS = [
 ]
 
 export const ORDER_HEADERS = [
-  '产品名称',
-  '货号',
+  '月份',
   '订购时间',
-  '出库日期',
   '订货单位',
   '订货人',
   '品牌',
+  '货号',
+  '品名',
   '单位',
   '目录价',
   '数量',
-  '销售总价',
+  '开票总价',
+  '开票情况',
+  '是否发货',
   '返现',
   '成本折扣',
   '成本单价',
   '成本总价',
   '售价折扣',
-  '销售单价',
+  '开票单价',
   '毛利',
   '备注',
-  '已退数量',
+  '发票号',
+  '是否回款',
+  '回款时间',
+]
+
+export const INVOICE_HEADERS = [
+  '发票号',
+  '开票日期',
+  '开票总额',
+  '是否回款',
+  '回款时间',
+  '关联出库单',
+  '备注',
   '创建时间',
 ]
 
@@ -65,6 +79,7 @@ export function defaultData(): AppData {
     products: [],
     customers: [],
     orders: [],
+    invoices: [],
     returns: [],
   }
 }
@@ -86,6 +101,12 @@ export function nowString(): string {
   const date = new Date()
   const pad = (value: number) => String(value).padStart(2, '0')
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+export function nowCompactString(): string {
+  const date = new Date()
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
 }
 
 export function formatMoney(value: number): string {
@@ -238,17 +259,19 @@ export function exportProductsCsv(products: Product[]): string {
 export function exportOrdersCsv(orders: Order[]): string {
   const rows = orders.map((order) =>
     csvRow([
-      order.productName,
-      order.itemNo,
+      order.month || normalizeDate(order.orderTime).slice(0, 7),
       order.orderTime,
-      order.deliveryDate,
       order.customerUnit,
       order.customerName,
       order.brand,
+      order.itemNo,
+      order.productName,
       order.unit,
       formatMoney(order.catalogPrice),
       formatMoney(order.quantity),
       formatMoney(order.invoiceTotal),
+      order.invoiceStatus,
+      order.isShipped ? '是' : '否',
       formatMoney(order.cashback),
       formatMoney(order.costDiscount),
       formatMoney(order.costUnitPrice),
@@ -257,11 +280,28 @@ export function exportOrdersCsv(orders: Order[]): string {
       formatMoney(order.invoiceUnitPrice),
       formatMoney(order.grossProfit),
       order.remark,
-      formatMoney(order.returnedQuantity),
-      order.createdAt,
+      order.invoiceNo,
+      order.isPaid ? '是' : '否',
+      order.paidTime,
     ]),
   )
   return csvWithHeader(ORDER_HEADERS, rows)
+}
+
+export function exportInvoicesCsv(invoices: Invoice[]): string {
+  const rows = invoices.map((invoice) =>
+    csvRow([
+      invoice.invoiceNo,
+      invoice.invoiceDate,
+      formatMoney(invoice.totalAmount),
+      invoice.isPaid ? '是' : '否',
+      invoice.paidTime,
+      invoice.lines.map((line) => `${line.orderNo}:${formatMoney(line.invoiceAmount)}`).join('; '),
+      invoice.remark,
+      invoice.createdAt,
+    ]),
+  )
+  return csvWithHeader(INVOICE_HEADERS, rows)
 }
 
 export function exportReturnsCsv(records: ReturnRecord[]): string {

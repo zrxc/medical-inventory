@@ -15,13 +15,15 @@ import {
   Printer,
   Refresh,
   Search,
+  Setting,
   Sunny,
   Tickets,
   Upload,
   User,
 } from '@element-plus/icons-vue'
-import type { AppData, Customer, CustomerForm, DailyStat, Order, OrderForm, Product, ProductForm, ReturnForm, ReturnRecord } from './types'
+import type { AppData, Customer, CustomerForm, DailyStat, Invoice, InvoiceLine, Order, OrderForm, Product, ProductForm, ReturnForm, ReturnRecord } from './types'
 import {
+  INVOICE_HEADERS,
   ORDER_HEADERS,
   PRODUCT_HEADERS,
   RETURN_HEADERS,
@@ -34,14 +36,25 @@ import {
   formatLocalDate,
   formatMoney,
   normalizeDate,
+  nowCompactString,
   nowString,
   parseAmount,
   proratedAmount,
   todayString,
 } from './inventory'
 
-type ImportType = 'products' | 'orders' | 'returns'
+type ImportType = 'products' | 'orders' | 'invoices' | 'returns'
 type AmountSummaryRow = Pick<Order, 'quantity' | 'invoiceTotal' | 'cashback' | 'costTotal' | 'grossProfit'>
+type PrintProfileKey = 'dotMatrix' | 'a4Portrait'
+
+interface InvoiceForm {
+  invoiceNo: string
+  invoiceDate: string
+  isPaid: boolean
+  paidTime: string
+  remark: string
+  lines: InvoiceLine[]
+}
 
 interface AmountSummary {
   quantity: number
@@ -51,6 +64,37 @@ interface AmountSummary {
   grossProfit: number
   averageInvoiceUnitPrice: number
   averageCostUnitPrice: number
+}
+
+interface ChartPoint {
+  x: number
+  y: number
+  value: number
+  label: string
+}
+
+interface ChartTick {
+  value: number
+  y: number
+}
+
+interface ChartLabel {
+  label: string
+  x: number
+}
+
+interface PieSlice {
+  label: string
+  value: number
+  percent: number
+  className: string
+  dashArray: string
+  dashOffset: number
+}
+
+interface DashboardDailyStat extends DailyStat {
+  netSalesAmount: number
+  grossProfitAmount: number
 }
 
 interface BatchOrderLine {
@@ -70,20 +114,108 @@ interface BatchOrderLine {
   remark: string
 }
 
+interface PrintProfile {
+  key: PrintProfileKey
+  label: string
+  pageSize: string
+  margin: string
+  sheetWidth: string
+  sheetMinHeight: string
+  titleSize: string
+  subtitleSize: string
+  orderNoSize: string
+  tableFontSize: string
+  cellHeight: string
+  itemRowHeight: string
+  blankRowHeight: string
+  signatureHeight: string
+  blankRows: number
+}
+
+interface PrintContentSettings {
+  companyName: string
+  documentTitle: string
+  orderNoPrefix: string
+  warehouseName: string
+  receiverSignatureLabel: string
+  receiverSignatureHint: string
+}
+
 const STORAGE_KEY = 'medical-inventory-vue-data'
 const THEME_KEY = 'medical-inventory-theme'
+const PRINT_PROFILE_STORAGE_KEY = 'medical-inventory-print-profile'
+const PRINT_CONTENT_SETTINGS_STORAGE_KEY = 'medical-inventory-print-content-settings'
 const AUTO_BACKUP_STORAGE_KEY = 'medical-inventory-auto-backup'
 const AUTO_BACKUP_FILENAME = 'inventory-auto-backup.json'
 const AUTO_BACKUP_INTERVAL = 10 * 60 * 1000
+const CHART_WIDTH = 760
+const CHART_HEIGHT = 280
+const CHART_PADDING = {
+  top: 28,
+  right: 34,
+  bottom: 42,
+  left: 78,
+}
+const PIE_RADIUS = 72
+const PIE_CIRCUMFERENCE = 2 * Math.PI * PIE_RADIUS
+const DEFAULT_PRINT_CONTENT_SETTINGS: PrintContentSettings = {
+  companyName: '武汉维优诺生物科技有限公司',
+  documentTitle: '送（销）货单',
+  orderNoPrefix: 'No:',
+  warehouseName: '普通舱',
+  receiverSignatureLabel: '收货人签名:',
+  receiverSignatureHint: '（“货物”“发票”已收到）',
+}
+
+const PRINT_PROFILES: PrintProfile[] = [
+  {
+    key: 'dotMatrix',
+    label: '针式打印机',
+    pageSize: '241mm 140mm',
+    margin: '4mm',
+    sheetWidth: '233mm',
+    sheetMinHeight: '132mm',
+    titleSize: '13.5pt',
+    subtitleSize: '12pt',
+    orderNoSize: '10.5pt',
+    tableFontSize: '9.6pt',
+    cellHeight: '7.8mm',
+    itemRowHeight: '10.5mm',
+    blankRowHeight: '7.6mm',
+    signatureHeight: '13mm',
+    blankRows: 3,
+  },
+  {
+    key: 'a4Portrait',
+    label: 'A4 纵版',
+    pageSize: 'A4 portrait',
+    margin: '6mm',
+    sheetWidth: '198mm',
+    sheetMinHeight: '285mm',
+    titleSize: '16pt',
+    subtitleSize: '14pt',
+    orderNoSize: '11.5pt',
+    tableFontSize: '10.5pt',
+    cellHeight: '10mm',
+    itemRowHeight: '12mm',
+    blankRowHeight: '10mm',
+    signatureHeight: '18mm',
+    blankRows: 12,
+  },
+]
 
 const activePage = ref('dashboard')
 const themeMode = ref<'light' | 'dark'>(localStorage.getItem(THEME_KEY) === 'dark' ? 'dark' : 'light')
+const printProfileKey = ref<PrintProfileKey>(normalizePrintProfileKey(localStorage.getItem(PRINT_PROFILE_STORAGE_KEY)))
+const printContentSettings = reactive<PrintContentSettings>(loadPrintContentSettings())
 const statusMessage = ref('就绪')
 const productQuery = ref('')
 const customerQuery = ref('')
 const orderQuery = ref('')
+const invoiceQuery = ref('')
 const returnQuery = ref('')
 const orderDateRange = ref<[string, string] | []>([])
+const invoiceDateRange = ref<[string, string] | []>([])
 const returnDateRange = ref<[string, string] | []>([])
 const productPage = ref(1)
 const productPageSize = ref(8)
@@ -91,6 +223,8 @@ const customerPage = ref(1)
 const customerPageSize = ref(8)
 const orderPage = ref(1)
 const orderPageSize = ref(8)
+const invoicePage = ref(1)
+const invoicePageSize = ref(8)
 const returnPage = ref(1)
 const returnPageSize = ref(8)
 const viewportHeight = ref(window.innerHeight)
@@ -100,17 +234,22 @@ let autoBackupTimer: ReturnType<typeof setInterval> | null = null
 const editingProductId = ref<string | null>(null)
 const editingCustomerId = ref<string | null>(null)
 const editingOrderId = ref<string | null>(null)
+const editingInvoiceId = ref<string | null>(null)
 const editingReturnId = ref<string | null>(null)
 const productDialogVisible = ref(false)
 const customerDialogVisible = ref(false)
 const orderDialogVisible = ref(false)
+const invoiceDialogVisible = ref(false)
 const returnDialogVisible = ref(false)
+const printSettingsDialogVisible = ref(false)
+const isPrinting = ref(false)
 const batchOrderDialogVisible = ref(false)
 const productFileInput = ref<HTMLInputElement | null>(null)
 const orderFileInput = ref<HTMLInputElement | null>(null)
 const returnFileInput = ref<HTMLInputElement | null>(null)
 const backupFileInput = ref<HTMLInputElement | null>(null)
 const selectedOrders = ref<Order[]>([])
+const invoiceForm = reactive<InvoiceForm>(blankInvoiceForm())
 const importDialogVisible = ref(false)
 const activeImportType = ref<ImportType>('products')
 const batchOrderCustomerId = ref<string | null>(null)
@@ -148,8 +287,21 @@ watch(
   { immediate: true },
 )
 
+watch(printProfileKey, (key) => {
+  localStorage.setItem(PRINT_PROFILE_STORAGE_KEY, key)
+})
+
+watch(
+  printContentSettings,
+  (settings) => {
+    localStorage.setItem(PRINT_CONTENT_SETTINGS_STORAGE_KEY, JSON.stringify(settings))
+  },
+  { deep: true },
+)
+
 const isDarkMode = computed(() => themeMode.value === 'dark')
 const autoPageSize = computed(() => Math.max(5, Math.floor((tableHeight.value - 54) / 46)))
+const activePrintProfile = computed(() => PRINT_PROFILES.find((profile) => profile.key === printProfileKey.value) ?? PRINT_PROFILES[0])
 
 onMounted(() => {
   window.addEventListener('resize', updateViewportHeight)
@@ -181,8 +333,16 @@ watch(orderQuery, () => {
   orderPage.value = 1
 })
 
+watch(invoiceQuery, () => {
+  invoicePage.value = 1
+})
+
 watch(orderDateRange, () => {
   orderPage.value = 1
+})
+
+watch(invoiceDateRange, () => {
+  invoicePage.value = 1
 })
 
 watch(returnQuery, () => {
@@ -201,6 +361,16 @@ watch(
 )
 
 watch(
+  () => orderForm.orderTime,
+  (value) => {
+    orderForm.month = monthFromDate(value)
+    if (!orderForm.deliveryDate) {
+      orderForm.deliveryDate = normalizeDate(value) || todayString()
+    }
+  },
+)
+
+watch(
   () => [returnForm.quantity, returnForm.invoiceUnitPrice, returnForm.costUnitPrice, returnForm.cashback],
   () => {
     syncReturnAmounts()
@@ -213,12 +383,13 @@ watch(
     productPageSize.value = pageSize
     customerPageSize.value = pageSize
     orderPageSize.value = pageSize
+    invoicePageSize.value = pageSize
     returnPageSize.value = pageSize
   },
   { immediate: true },
 )
 
-watch([activePage, productQuery, customerQuery, orderQuery, returnQuery, orderDateRange, returnDateRange], () => {
+watch([activePage, productQuery, customerQuery, orderQuery, invoiceQuery, returnQuery, orderDateRange, invoiceDateRange, returnDateRange], () => {
   scheduleTableHeightUpdate()
 })
 
@@ -226,7 +397,8 @@ const navItems = [
   { key: 'dashboard', label: '看板', icon: DataAnalysis },
   { key: 'products', label: '产品管理', icon: Goods },
   { key: 'customers', label: '客户管理', icon: User },
-  { key: 'orders', label: '下单管理', icon: Tickets },
+  { key: 'orders', label: '出库单', icon: Tickets },
+  { key: 'invoices', label: '发票管理', icon: DocumentAdd },
   { key: 'returns', label: '退货管理', icon: Refresh },
 ]
 
@@ -287,18 +459,42 @@ const sortedOrders = computed(() =>
 const filteredOrders = computed(() =>
   sortedOrders.value.filter((order) => {
     const queryMatched = matchesQuery(orderQuery.value, [
+      order.orderNo,
       order.productName,
       order.itemNo,
       order.customerUnit,
       order.customerName,
+      order.invoiceNo,
       order.remark,
     ])
-    return queryMatched && dateInRange(order.deliveryDate, orderDateRange.value)
+    return queryMatched && dateInRange(order.orderTime, orderDateRange.value)
   }),
 )
 
 const pagedOrders = computed(() => paginate(filteredOrders.value, orderPage.value, orderPageSize.value))
 const filteredOrderAmountSummary = computed(() => summarizeAmounts(filteredOrders.value))
+
+const sortedInvoices = computed(() =>
+  [...data.invoices].sort(
+    (left, right) => dateValue(right.invoiceDate) - dateValue(left.invoiceDate) || right.createdAt.localeCompare(left.createdAt),
+  ),
+)
+
+const filteredInvoices = computed(() =>
+  sortedInvoices.value.filter((invoice) => {
+    const queryMatched = matchesQuery(invoiceQuery.value, [
+      invoice.invoiceNo,
+      invoice.remark,
+      invoice.lines.map((line) => `${line.orderNo} ${line.productName} ${line.itemNo} ${line.customerUnit}`).join(' '),
+    ])
+    return queryMatched && dateInRange(invoice.invoiceDate, invoiceDateRange.value)
+  }),
+)
+
+const pagedInvoices = computed(() => paginate(filteredInvoices.value, invoicePage.value, invoicePageSize.value))
+const invoiceTotalAmount = computed(() => data.invoices.reduce((sum, invoice) => sum + invoice.totalAmount, 0))
+const filteredInvoiceTotalAmount = computed(() => filteredInvoices.value.reduce((sum, invoice) => sum + invoice.totalAmount, 0))
+const invoiceFormTotalAmount = computed(() => invoiceForm.lines.reduce((sum, line) => sum + Number(line.invoiceAmount || 0), 0))
 
 const sortedReturns = computed(() =>
   [...data.returns].sort(
@@ -327,39 +523,66 @@ const returnableOrders = computed(() => data.orders.filter((order) => currentOut
 const totalOrderAmount = computed(() => data.orders.reduce((sum, order) => sum + order.invoiceTotal, 0))
 const totalReturnAmount = computed(() => data.returns.reduce((sum, record) => sum + record.invoiceTotal, 0))
 const netAmount = computed(() => totalOrderAmount.value - totalReturnAmount.value)
+const totalOrderGrossProfit = computed(() => data.orders.reduce((sum, order) => sum + order.grossProfit, 0))
+const totalReturnGrossProfit = computed(() => data.returns.reduce((sum, record) => sum + record.grossProfit, 0))
+const netGrossProfit = computed(() => totalOrderGrossProfit.value - totalReturnGrossProfit.value)
 const currentOutboundTotal = computed(() => data.orders.reduce((sum, order) => sum + currentOutboundAmount(order), 0))
 const returnableOrderCount = computed(() => data.orders.filter((order) => currentOutboundQuantity(order) > 0).length)
 const todayOutboundAmount = computed(() =>
   data.orders
     .filter((order) => normalizeDate(order.deliveryDate) === todayString())
-    .reduce((sum, order) => sum + currentOutboundAmount(order), 0),
+    .reduce((sum, order) => sum + order.invoiceTotal, 0),
 )
 const todayReturnAmount = computed(() =>
   data.returns
     .filter((record) => normalizeDate(record.returnTime) === todayString())
     .reduce((sum, record) => sum + record.invoiceTotal, 0),
 )
+const todayOrderGrossProfit = computed(() =>
+  data.orders
+    .filter((order) => normalizeDate(order.deliveryDate) === todayString())
+    .reduce((sum, order) => sum + order.grossProfit, 0),
+)
+const todayReturnGrossProfit = computed(() =>
+  data.returns
+    .filter((record) => normalizeDate(record.returnTime) === todayString())
+    .reduce((sum, record) => sum + record.grossProfit, 0),
+)
+const todayNetAmount = computed(() => todayOutboundAmount.value - todayReturnAmount.value)
+const todayNetGrossProfit = computed(() => todayOrderGrossProfit.value - todayReturnGrossProfit.value)
+const netGrossProfitRate = computed(() => percentOf(netGrossProfit.value, netAmount.value))
+const todayNetGrossProfitRate = computed(() => percentOf(todayNetGrossProfit.value, todayNetAmount.value))
 
-const dailySeries = computed<DailyStat[]>(() => {
+const dailySeries = computed<DashboardDailyStat[]>(() => {
   const start = dateValue(dashboardFilter.startDate)
   const end = dateValue(dashboardFilter.endDate)
   if (!start || !end || start > end) {
     return []
   }
 
-  const result: DailyStat[] = []
+  const result: DashboardDailyStat[] = []
   const cursor = new Date(start)
   const last = new Date(end)
   while (cursor <= last && result.length < 45) {
     const label = formatLocalDate(cursor)
+    const outboundAmount = data.orders
+      .filter((order) => normalizeDate(order.deliveryDate) === label)
+      .reduce((sum, order) => sum + order.invoiceTotal, 0)
+    const returnAmount = data.returns
+      .filter((record) => normalizeDate(record.returnTime) === label)
+      .reduce((sum, record) => sum + record.invoiceTotal, 0)
+    const orderGrossProfit = data.orders
+      .filter((order) => normalizeDate(order.deliveryDate) === label)
+      .reduce((sum, order) => sum + order.grossProfit, 0)
+    const returnGrossProfit = data.returns
+      .filter((record) => normalizeDate(record.returnTime) === label)
+      .reduce((sum, record) => sum + record.grossProfit, 0)
     result.push({
       label,
-      outboundAmount: data.orders
-        .filter((order) => normalizeDate(order.deliveryDate) === label)
-        .reduce((sum, order) => sum + currentOutboundAmount(order), 0),
-      returnAmount: data.returns
-        .filter((record) => normalizeDate(record.returnTime) === label)
-        .reduce((sum, record) => sum + record.invoiceTotal, 0),
+      outboundAmount,
+      returnAmount,
+      netSalesAmount: outboundAmount - returnAmount,
+      grossProfitAmount: orderGrossProfit - returnGrossProfit,
     })
     cursor.setDate(cursor.getDate() + 1)
   }
@@ -367,8 +590,134 @@ const dailySeries = computed<DailyStat[]>(() => {
 })
 
 const maxDailyAmount = computed(() =>
-  Math.max(1, ...dailySeries.value.flatMap((item) => [item.outboundAmount, item.returnAmount])),
+  Math.max(1, ...dailySeries.value.flatMap((item) => [item.netSalesAmount, item.grossProfitAmount].map(Math.abs))),
 )
+
+const chartInnerWidth = CHART_WIDTH - CHART_PADDING.left - CHART_PADDING.right
+const chartInnerHeight = CHART_HEIGHT - CHART_PADDING.top - CHART_PADDING.bottom
+
+const chartMaxAmount = computed(() => {
+  const rawMax = maxDailyAmount.value
+  if (rawMax <= 1) {
+    return 1
+  }
+  const magnitude = 10 ** Math.max(0, Math.floor(Math.log10(rawMax)) - 1)
+  return Math.ceil(rawMax / magnitude) * magnitude
+})
+
+const chartScaleMax = computed(() => chartMaxAmount.value)
+const chartScaleMin = computed(() =>
+  dailySeries.value.some((item) => item.netSalesAmount < 0 || item.grossProfitAmount < 0) ? -chartMaxAmount.value : 0,
+)
+
+const netSalesChartPoints = computed<ChartPoint[]>(() =>
+  makeChartPoints(dailySeries.value, (item) => item.netSalesAmount),
+)
+
+const grossProfitChartPoints = computed<ChartPoint[]>(() =>
+  makeChartPoints(dailySeries.value, (item) => item.grossProfitAmount),
+)
+
+const netSalesChartPath = computed(() => makeLinePath(netSalesChartPoints.value))
+const grossProfitChartPath = computed(() => makeLinePath(grossProfitChartPoints.value))
+
+const chartAreaPath = computed(() => {
+  const points = netSalesChartPoints.value
+  if (points.length === 0) {
+    return ''
+  }
+  const baseline = chartValueY(0)
+  return `${makeLinePath(points)} L ${points[points.length - 1].x} ${baseline} L ${points[0].x} ${baseline} Z`
+})
+
+const chartTicks = computed<ChartTick[]>(() =>
+  {
+    const tickCount = chartScaleMin.value < 0 ? 5 : 4
+    return Array.from({ length: tickCount }, (_, index) => {
+      const ratio = index / (tickCount - 1)
+      const value = chartScaleMax.value - (chartScaleMax.value - chartScaleMin.value) * ratio
+      return {
+        value,
+        y: chartValueY(value),
+      }
+    })
+  },
+)
+
+const chartLabels = computed<ChartLabel[]>(() => {
+  const series = dailySeries.value
+  if (series.length === 0) {
+    return []
+  }
+  if (series.length === 1) {
+    return [{ label: series[0].label.slice(5), x: CHART_PADDING.left }]
+  }
+  const labelIndexes = new Set([0, Math.floor((series.length - 1) / 2), series.length - 1])
+  return [...labelIndexes].sort((left, right) => left - right).map((index) => ({
+    label: series[index].label.slice(5),
+    x: CHART_PADDING.left + (chartInnerWidth * index) / (series.length - 1),
+  }))
+})
+
+const rangeOutboundAmount = computed(() =>
+  dailySeries.value.reduce((sum, item) => sum + item.outboundAmount, 0),
+)
+
+const rangeReturnAmount = computed(() =>
+  dailySeries.value.reduce((sum, item) => sum + item.returnAmount, 0),
+)
+
+const rangeOutboundQuantity = computed(() =>
+  data.orders
+    .filter((order) => dashboardDateMatched(order.deliveryDate))
+    .reduce((sum, order) => sum + order.quantity, 0),
+)
+const rangeReturnQuantity = computed(() =>
+  data.returns
+    .filter((record) => dashboardDateMatched(record.returnTime))
+    .reduce((sum, record) => sum + record.quantity, 0),
+)
+const rangeNetAmount = computed(() => rangeOutboundAmount.value - rangeReturnAmount.value)
+const rangeGrossProfitAmount = computed(() =>
+  dailySeries.value.reduce((sum, item) => sum + item.grossProfitAmount, 0),
+)
+const rangeGrossProfitRate = computed(() => percentOf(rangeGrossProfitAmount.value, rangeNetAmount.value))
+const rangeReturnImpactRate = computed(() => percentOf(rangeReturnAmount.value, rangeOutboundAmount.value))
+const rangeInvoiceAmount = computed(() =>
+  data.invoices
+    .filter((invoice) => dashboardDateMatched(invoice.invoiceDate))
+    .reduce((sum, invoice) => sum + invoice.totalAmount, 0),
+)
+const rangePaidInvoiceAmount = computed(() =>
+  data.invoices
+    .filter((invoice) => invoice.isPaid && dashboardDateMatched(invoice.invoiceDate))
+    .reduce((sum, invoice) => sum + invoice.totalAmount, 0),
+)
+const rangeUnpaidInvoiceAmount = computed(() => rangeInvoiceAmount.value - rangePaidInvoiceAmount.value)
+const rangePaidRate = computed(() => percentOf(rangePaidInvoiceAmount.value, rangeInvoiceAmount.value))
+const chartHasData = computed(() => dailySeries.value.some((item) => item.outboundAmount > 0 || item.returnAmount > 0))
+const pieTotalAmount = computed(() => Math.max(0, rangeOutboundAmount.value) + Math.max(0, rangeReturnAmount.value))
+
+const pieSlices = computed<PieSlice[]>(() => {
+  const values = [
+    { label: '出库金额', value: Math.max(0, rangeOutboundAmount.value), className: 'outbound' },
+    { label: '退货金额', value: Math.max(0, rangeReturnAmount.value), className: 'returns' },
+  ]
+  const total = pieTotalAmount.value
+  let offset = 0
+  return values.map((item) => {
+    const percent = total > 0 ? item.value / total : 0
+    const length = percent * PIE_CIRCUMFERENCE
+    const slice = {
+      ...item,
+      percent,
+      dashArray: `${length} ${PIE_CIRCUMFERENCE - length}`,
+      dashOffset: -offset,
+    }
+    offset += length
+    return slice
+  })
+})
 
 function loadData(): AppData {
   const saved = localStorage.getItem(STORAGE_KEY)
@@ -382,13 +731,81 @@ function loadData(): AppData {
       unit: product.unit || '件',
     }))
     loaded.customers = Array.isArray(loaded.customers) ? loaded.customers : []
-    loaded.orders = loaded.orders.map((order) => ({
-      ...order,
-      customerId: order.customerId ?? findCustomerIdByText(loaded.customers, order.customerUnit, order.customerName),
-    }))
+    loaded.orders = Array.isArray(loaded.orders)
+      ? loaded.orders.map((order) => normalizeLoadedOrder(order, loaded.customers))
+      : []
+    loaded.invoices = Array.isArray(loaded.invoices) ? loaded.invoices.map(normalizeLoadedInvoice) : []
+    loaded.returns = Array.isArray(loaded.returns) ? loaded.returns : []
+    syncInvoiceBackfills(loaded.orders, loaded.invoices, false)
     return loaded
   } catch {
     return defaultData()
+  }
+}
+
+function normalizeLoadedOrder(order: Partial<Order>, customers: Customer[]): Order {
+  const orderTime = normalizeDate(order.orderTime ?? '') || todayString()
+  const deliveryDate = normalizeDate(order.deliveryDate ?? '') || orderTime
+  const itemNo = order.itemNo?.trim() || 'ITEM'
+  const invoiceTotal = Number(order.invoiceTotal ?? 0)
+  return {
+    id: order.id || createId(),
+    orderNo: order.orderNo || generateOrderNo(itemNo),
+    productId: order.productId ?? null,
+    customerId: order.customerId ?? findCustomerIdByText(customers, order.customerUnit ?? '', order.customerName ?? ''),
+    month: order.month || monthFromDate(orderTime),
+    productName: order.productName ?? '',
+    itemNo,
+    orderTime,
+    deliveryDate,
+    customerUnit: order.customerUnit ?? '',
+    customerName: order.customerName ?? '',
+    brand: order.brand ?? '',
+    unit: order.unit || '件',
+    catalogPrice: Number(order.catalogPrice ?? 0),
+    quantity: Number(order.quantity ?? 0),
+    invoiceTotal,
+    invoiceStatus: order.invoiceStatus || (order.invoiceNo ? '全部开票' : '未开票'),
+    isShipped: order.isShipped ?? true,
+    cashback: Number(order.cashback ?? 0),
+    costDiscount: Number(order.costDiscount ?? 0),
+    costUnitPrice: Number(order.costUnitPrice ?? 0),
+    costTotal: Number(order.costTotal ?? 0),
+    saleDiscount: Number(order.saleDiscount ?? 0),
+    invoiceUnitPrice: Number(order.invoiceUnitPrice ?? 0),
+    grossProfit: Number(order.grossProfit ?? 0),
+    remark: order.remark ?? '',
+    invoiceNo: order.invoiceNo ?? '',
+    isPaid: order.isPaid ?? Boolean(order.paidTime),
+    paidTime: normalizeDate(order.paidTime ?? '') || '',
+    returnedQuantity: Number(order.returnedQuantity ?? 0),
+    createdAt: order.createdAt || nowString(),
+  }
+}
+
+function normalizeLoadedInvoice(invoice: Partial<Invoice>): Invoice {
+  const lines = Array.isArray(invoice.lines) ? invoice.lines : []
+  const normalizedLines: InvoiceLine[] = lines.map((line) => ({
+    id: line.id || createId(),
+    orderId: line.orderId,
+    orderNo: line.orderNo || '',
+    productName: line.productName || '',
+    itemNo: line.itemNo || '',
+    customerUnit: line.customerUnit || '',
+    customerName: line.customerName || '',
+    orderAmount: Number(line.orderAmount ?? 0),
+    invoiceAmount: Number(line.invoiceAmount ?? 0),
+  }))
+  return {
+    id: invoice.id || createId(),
+    invoiceNo: invoice.invoiceNo || generateInvoiceNo(),
+    invoiceDate: normalizeDate(invoice.invoiceDate ?? '') || todayString(),
+    isPaid: invoice.isPaid ?? false,
+    paidTime: normalizeDate(invoice.paidTime ?? '') || '',
+    totalAmount: Number(invoice.totalAmount ?? normalizedLines.reduce((sum, line) => sum + line.invoiceAmount, 0)),
+    remark: invoice.remark || '',
+    lines: normalizedLines,
+    createdAt: invoice.createdAt || nowString(),
   }
 }
 
@@ -435,8 +852,10 @@ function blankBatchOrderLine(): BatchOrderLine {
 
 function blankOrderForm(): OrderForm {
   return {
+    orderNo: '',
     productId: null,
     customerId: null,
+    month: monthFromDate(todayString()),
     productName: '',
     itemNo: '',
     orderTime: todayString(),
@@ -448,6 +867,8 @@ function blankOrderForm(): OrderForm {
     catalogPrice: '0',
     quantity: '1',
     invoiceTotal: '0',
+    invoiceStatus: '未开票',
+    isShipped: true,
     cashback: '0',
     costDiscount: '0',
     costUnitPrice: '0',
@@ -456,7 +877,20 @@ function blankOrderForm(): OrderForm {
     invoiceUnitPrice: '0',
     grossProfit: '0',
     remark: '',
-    paidTime: todayString(),
+    invoiceNo: '',
+    isPaid: false,
+    paidTime: '',
+  }
+}
+
+function blankInvoiceForm(): InvoiceForm {
+  return {
+    invoiceNo: generateInvoiceNo(),
+    invoiceDate: todayString(),
+    isPaid: false,
+    paidTime: '',
+    remark: '',
+    lines: [],
   }
 }
 
@@ -510,6 +944,120 @@ function dateInRange(dateText: string, range: [string, string] | []): boolean {
   const start = dateValue(range[0])
   const end = dateValue(range[1])
   return value >= start && value <= end
+}
+
+function dashboardDateMatched(dateText: string): boolean {
+  const value = dateValue(normalizeDate(dateText))
+  const start = dateValue(dashboardFilter.startDate)
+  const end = dateValue(dashboardFilter.endDate)
+  return Boolean(value && start && end && value >= start && value <= end)
+}
+
+function monthFromDate(dateText: string): string {
+  const normalized = normalizeDate(dateText) || todayString()
+  return normalized.slice(0, 7)
+}
+
+function normalizeImportMonth(value: string | undefined, orderTime: string): string {
+  const text = String(value ?? '').trim()
+  if (!text) {
+    return monthFromDate(orderTime)
+  }
+  const numericMonth = Number(text)
+  if (Number.isInteger(numericMonth) && numericMonth >= 1 && numericMonth <= 12) {
+    return String(numericMonth)
+  }
+  return text
+}
+
+function yesNo(value: boolean): string {
+  return value ? '是' : '否'
+}
+
+function parseYesNo(value: string | undefined, defaultValue = false): boolean {
+  const text = String(value ?? '').trim()
+  if (!text) {
+    return defaultValue
+  }
+  return ['是', '已发货', '已回款', 'true', '1', 'yes', 'y'].includes(text.toLowerCase())
+}
+
+function normalizePrintProfileKey(value: string | null): PrintProfileKey {
+  return value === 'a4Portrait' || value === 'a4Landscape' ? 'a4Portrait' : 'dotMatrix'
+}
+
+function loadPrintContentSettings(): PrintContentSettings {
+  try {
+    const saved = localStorage.getItem(PRINT_CONTENT_SETTINGS_STORAGE_KEY)
+    if (!saved) {
+      return { ...DEFAULT_PRINT_CONTENT_SETTINGS }
+    }
+    const parsed = JSON.parse(saved) as Partial<PrintContentSettings>
+    return normalizePrintContentSettings(parsed)
+  } catch {
+    return { ...DEFAULT_PRINT_CONTENT_SETTINGS }
+  }
+}
+
+function normalizePrintContentSettings(value: Partial<PrintContentSettings>): PrintContentSettings {
+  return {
+    companyName: String(value.companyName ?? DEFAULT_PRINT_CONTENT_SETTINGS.companyName),
+    documentTitle: String(value.documentTitle ?? DEFAULT_PRINT_CONTENT_SETTINGS.documentTitle),
+    orderNoPrefix: String(value.orderNoPrefix ?? DEFAULT_PRINT_CONTENT_SETTINGS.orderNoPrefix),
+    warehouseName: String(value.warehouseName ?? DEFAULT_PRINT_CONTENT_SETTINGS.warehouseName),
+    receiverSignatureLabel: String(value.receiverSignatureLabel ?? DEFAULT_PRINT_CONTENT_SETTINGS.receiverSignatureLabel),
+    receiverSignatureHint: String(value.receiverSignatureHint ?? DEFAULT_PRINT_CONTENT_SETTINGS.receiverSignatureHint),
+  }
+}
+
+function resetPrintContentSettings(): void {
+  Object.assign(printContentSettings, DEFAULT_PRINT_CONTENT_SETTINGS)
+}
+
+function generateOrderItemNo(product?: Product, _sequenceOffset = 0): string {
+  return product?.specification?.trim() || product?.name?.trim() || 'ITEM'
+}
+
+function random4(): string {
+  return String(Math.floor(Math.random() * 10000)).padStart(4, '0')
+}
+
+function generateOrderNo(itemNo: string): string {
+  const prefix = itemNo.trim() || 'ITEM'
+  return `${prefix}-${nowCompactString()}${random4()}`
+}
+
+function generateInvoiceNo(): string {
+  return `FP-${nowCompactString()}${random4()}`
+}
+
+function invoiceStatusForAmount(invoiceAmount: number, orderAmount: number): string {
+  if (invoiceAmount <= 0) {
+    return '未开票'
+  }
+  return invoiceAmount + Number.EPSILON >= orderAmount ? '全部开票' : '部分开票'
+}
+
+function syncInvoiceBackfills(orders: Order[] = data.orders, invoices: Invoice[] = data.invoices, clearUnrelated = true): void {
+  orders.forEach((order) => {
+    const related = invoices.filter((invoice) => invoice.lines.some((line) => line.orderId === order.id))
+    const invoiceAmount = related.reduce(
+      (sum, invoice) => sum + invoice.lines.filter((line) => line.orderId === order.id).reduce((lineSum, line) => lineSum + Number(line.invoiceAmount || 0), 0),
+      0,
+    )
+    if (!related.length && !clearUnrelated) {
+      return
+    }
+    order.invoiceStatus = invoiceStatusForAmount(invoiceAmount, order.invoiceTotal)
+    order.invoiceNo = related.map((invoice) => invoice.invoiceNo).filter(Boolean).join('、')
+    if (related.length > 0) {
+      order.isPaid = related.every((invoice) => invoice.isPaid)
+      order.paidTime = related.every((invoice) => invoice.isPaid) ? related.map((invoice) => invoice.paidTime).filter(Boolean).sort().at(-1) ?? '' : ''
+    } else {
+      order.isPaid = false
+      order.paidTime = ''
+    }
+  })
 }
 
 function summarizeAmounts(rows: AmountSummaryRow[]): AmountSummary {
@@ -581,14 +1129,65 @@ function navCount(key: string): string {
   if (key === 'orders') {
     return String(data.orders.length)
   }
+  if (key === 'invoices') {
+    return String(data.invoices.length)
+  }
   if (key === 'returns') {
     return String(data.returns.length)
   }
-  return String(data.products.length + data.customers.length + data.orders.length + data.returns.length)
+  return String(data.products.length + data.customers.length + data.orders.length + data.invoices.length + data.returns.length)
 }
 
 function identity(value: string): string {
   return value.trim().toLowerCase()
+}
+
+function identityNumber(value: number): string {
+  return Number.isFinite(value) ? value.toFixed(6).replace(/\.?0+$/, '') : '0'
+}
+
+function orderImportKey(order: Pick<Order,
+  | 'month'
+  | 'productName'
+  | 'itemNo'
+  | 'orderTime'
+  | 'customerUnit'
+  | 'customerName'
+  | 'brand'
+  | 'unit'
+  | 'catalogPrice'
+  | 'quantity'
+  | 'cashback'
+  | 'costDiscount'
+  | 'costUnitPrice'
+  | 'saleDiscount'
+  | 'invoiceUnitPrice'
+  | 'remark'
+  | 'invoiceNo'
+  | 'isShipped'
+  | 'returnedQuantity'
+>): string {
+  return [
+    identity(order.month),
+    identity(order.productName),
+    identity(order.itemNo),
+    normalizeDate(order.orderTime) || identity(order.orderTime),
+    identity(order.customerUnit),
+    identity(order.customerName),
+    identity(order.brand),
+    identity(order.unit),
+    identityNumber(order.catalogPrice),
+    identityNumber(order.quantity),
+    identityNumber(order.cashback),
+    identityNumber(order.costDiscount),
+    identityNumber(order.costUnitPrice),
+    identityNumber(order.saleDiscount),
+    identityNumber(order.invoiceUnitPrice),
+    identity(order.remark),
+    identity(order.invoiceNo),
+    order.isShipped ? '1' : '0',
+    identityNumber(order.returnedQuantity),
+  ].join('|')
 }
 
 function findCustomerIdByText(customers: Customer[], unit: string, contactName: string): string | null {
@@ -596,6 +1195,81 @@ function findCustomerIdByText(customers: Customer[], unit: string, contactName: 
     (item) => identity(item.unit) === identity(unit) && identity(item.contactName) === identity(contactName),
   )
   return customer?.id ?? null
+}
+
+function ensureCustomerForOrderImport(unit: string, contactName: string): Customer | null {
+  const normalizedUnit = unit.trim()
+  const normalizedContactName = contactName.trim()
+  if (!normalizedUnit && !normalizedContactName) {
+    return null
+  }
+
+  const existing = data.customers.find(
+    (item) => identity(item.unit) === identity(normalizedUnit) && identity(item.contactName) === identity(normalizedContactName),
+  )
+  if (existing) {
+    return existing
+  }
+
+  const customer: Customer = {
+    id: createId(),
+    unit: normalizedUnit,
+    contactName: normalizedContactName,
+    phone: '',
+    address: '',
+    remark: '出库单导入自动创建',
+    createdAt: nowString(),
+  }
+  data.customers.push(customer)
+  return customer
+}
+
+function findProductForOrderImport(productName: string, brand: string, itemNo: string): Product | null {
+  const normalizedItemNo = identity(itemNo)
+  const exact = data.products.find(
+    (item) =>
+      identity(item.name) === identity(productName)
+      && identity(item.brand) === identity(brand)
+      && identity(item.specification) === normalizedItemNo,
+  )
+  if (exact) {
+    return exact
+  }
+  if (normalizedItemNo) {
+    return null
+  }
+
+  return data.products.find(
+    (item) => identity(item.name) === identity(productName) && identity(item.brand) === identity(brand),
+  ) ?? null
+}
+
+function ensureProductForOrderImport(
+  productName: string,
+  brand: string,
+  itemNo: string,
+  unit: string,
+  purchasePrice: number,
+  outboundPrice: number,
+): Product {
+  const existing = findProductForOrderImport(productName, brand, itemNo)
+  if (existing) {
+    return existing
+  }
+
+  const product: Product = {
+    id: createId(),
+    name: productName,
+    purchasePrice,
+    outboundPrice,
+    specification: itemNo,
+    brand,
+    unit: unit || '件',
+    description: '出库单导入自动创建',
+    createdAt: nowString(),
+  }
+  data.products.push(product)
+  return product
 }
 
 function customerOrders(customer: Customer): Order[] {
@@ -632,6 +1306,14 @@ function openOrdersForCustomer(customer: Customer): void {
   scheduleTableHeightUpdate()
 }
 
+function openOrdersForInvoice(invoice: Invoice): void {
+  activePage.value = 'orders'
+  orderQuery.value = invoice.invoiceNo
+  orderPage.value = 1
+  statusMessage.value = `已筛选发票关联出库单：${invoice.invoiceNo}`
+  scheduleTableHeightUpdate()
+}
+
 function openReturnsForCustomer(customer: Customer): void {
   activePage.value = 'returns'
   returnQuery.value = customer.unit
@@ -652,6 +1334,17 @@ function parseNonNegative(label: string, value: string): number {
     throw new Error(`${label}不能小于 0`)
   }
   return parsed
+}
+
+function parseImportCashback(value: string | undefined): number {
+  const text = String(value ?? '').trim()
+  if (!text) {
+    return 0
+  }
+  if (['是', '否', '已返现', '未返现', 'true', 'false', 'yes', 'no', 'y', 'n'].includes(text.toLowerCase())) {
+    return 0
+  }
+  return parseNonNegative('返现', text)
 }
 
 function parsePositive(label: string, value: string): number {
@@ -980,6 +1673,7 @@ function saveBatchOrders(): void {
       syncBatchOrderRowAmounts(row)
       const product = data.products.find((item) => item.id === row.productId)
       const productName = row.productName.trim() || product?.name || ''
+      const itemNo = row.itemNo.trim() || generateOrderItemNo(product, index)
       if (!productName) {
         throw new Error(`第 ${index + 1} 行产品不能为空`)
       }
@@ -993,10 +1687,12 @@ function saveBatchOrders(): void {
 
       data.orders.push({
         id: createId(),
+        orderNo: generateOrderNo(itemNo),
         productId: row.productId,
         customerId: customer.id,
+        month: monthFromDate(orderTime),
         productName,
-        itemNo: row.itemNo.trim() || generateOrderItemNo(product, index),
+        itemNo,
         orderTime,
         deliveryDate,
         customerUnit: customer.unit,
@@ -1006,6 +1702,8 @@ function saveBatchOrders(): void {
         catalogPrice: invoiceUnitPrice,
         quantity,
         invoiceTotal,
+        invoiceStatus: '未开票',
+        isShipped: true,
         cashback,
         costDiscount: 0,
         costUnitPrice,
@@ -1014,7 +1712,9 @@ function saveBatchOrders(): void {
         invoiceUnitPrice,
         grossProfit: invoiceTotal - costTotal - cashback,
         remark: row.remark.trim(),
-        paidTime,
+        invoiceNo: '',
+        isPaid: false,
+        paidTime: '',
         returnedQuantity: 0,
         createdAt: nowString(),
       })
@@ -1044,15 +1744,6 @@ function applyProductToOrder(productId: string): void {
   orderForm.invoiceUnitPrice = formatMoney(product.outboundPrice)
   orderForm.costUnitPrice = formatMoney(product.purchasePrice)
   recalculateOrderAmounts(false)
-}
-
-function generateOrderItemNo(product?: Product, sequenceOffset = 0): string {
-  const prefix = product?.brand?.trim()
-    ? product.brand.trim().slice(0, 2).toUpperCase()
-    : 'ITEM'
-  const dateText = todayString().replaceAll('-', '')
-  const sequence = String(data.orders.length + sequenceOffset + 1).padStart(3, '0')
-  return `${prefix}-${dateText}-${sequence}`
 }
 
 function applyCustomerToOrder(customerId: string): void {
@@ -1118,12 +1809,17 @@ function buildOrder(id: string, returnedQuantity: number, createdAt: string): Or
     throw new Error(`订单数量不能小于已退数量 ${formatMoney(returnedQuantity)}`)
   }
 
+  const itemNo = orderForm.itemNo.trim() || generateOrderItemNo(data.products.find((product) => product.id === orderForm.productId) ?? undefined)
+  const existingOrder = data.orders.find((order) => order.id === id)
+
   return {
     id,
+    orderNo: orderForm.orderNo.trim() || existingOrder?.orderNo || generateOrderNo(itemNo),
     productId: orderForm.productId,
     customerId: orderForm.customerId,
+    month: monthFromDate(orderTime),
     productName: orderForm.productName.trim(),
-    itemNo: orderForm.itemNo.trim() || generateOrderItemNo(data.products.find((product) => product.id === orderForm.productId) ?? undefined),
+    itemNo,
     orderTime,
     deliveryDate,
     customerUnit: orderForm.customerUnit.trim(),
@@ -1132,16 +1828,20 @@ function buildOrder(id: string, returnedQuantity: number, createdAt: string): Or
     unit: orderForm.unit.trim() || '件',
     catalogPrice: parseNonNegative('目录价', orderForm.catalogPrice),
     quantity,
-    invoiceTotal: parseNonNegative('销售总价', orderForm.invoiceTotal),
+    invoiceTotal: parseNonNegative('开票总价', orderForm.invoiceTotal),
+    invoiceStatus: existingOrder?.invoiceStatus || orderForm.invoiceStatus || '未开票',
+    isShipped: orderForm.isShipped,
     cashback: parseNonNegative('返现', orderForm.cashback),
     costDiscount: parseNonNegative('成本折扣', orderForm.costDiscount),
     costUnitPrice: parseNonNegative('成本单价', orderForm.costUnitPrice),
     costTotal: parseNonNegative('成本总价', orderForm.costTotal),
     saleDiscount: parseNonNegative('售价折扣', orderForm.saleDiscount),
-    invoiceUnitPrice: parseNonNegative('销售单价', orderForm.invoiceUnitPrice),
+    invoiceUnitPrice: parseNonNegative('开票单价', orderForm.invoiceUnitPrice),
     grossProfit: parseAmount(orderForm.grossProfit),
     remark: orderForm.remark.trim(),
-    paidTime: normalizeDate(orderForm.paidTime) || todayString(),
+    invoiceNo: existingOrder?.invoiceNo ?? '',
+    isPaid: existingOrder?.isPaid ?? false,
+    paidTime: normalizeDate(existingOrder?.paidTime ?? '') || '',
     returnedQuantity,
     createdAt,
   }
@@ -1156,17 +1856,18 @@ function saveOrder(): void {
       }
       const next = buildOrder(existing.id, existing.returnedQuantity, existing.createdAt)
       data.orders.splice(data.orders.indexOf(existing), 1, next)
+      syncInvoiceBackfills()
       editingOrderId.value = null
       Object.assign(orderForm, blankOrderForm())
       orderDialogVisible.value = false
-      markSaved('订单已更新')
+      markSaved('出库单已更新')
       return
     }
 
     data.orders.push(buildOrder(createId(), 0, nowString()))
     Object.assign(orderForm, blankOrderForm())
     orderDialogVisible.value = false
-    markSaved('订单已新增')
+    markSaved('出库单已新增')
   })
 }
 
@@ -1178,8 +1879,10 @@ function openOrderCreate(): void {
 
 function editOrder(order: Order): void {
   Object.assign(orderForm, {
+    orderNo: order.orderNo,
     productId: order.productId,
     customerId: order.customerId ?? findCustomerIdByText(data.customers, order.customerUnit, order.customerName),
+    month: order.month || monthFromDate(order.orderTime),
     productName: order.productName,
     itemNo: order.itemNo,
     orderTime: order.orderTime,
@@ -1191,6 +1894,8 @@ function editOrder(order: Order): void {
     catalogPrice: formatMoney(order.catalogPrice),
     quantity: formatMoney(order.quantity),
     invoiceTotal: formatMoney(order.invoiceTotal),
+    invoiceStatus: order.invoiceStatus,
+    isShipped: order.isShipped,
     cashback: formatMoney(order.cashback),
     costDiscount: formatMoney(order.costDiscount),
     costUnitPrice: formatMoney(order.costUnitPrice),
@@ -1199,6 +1904,8 @@ function editOrder(order: Order): void {
     invoiceUnitPrice: formatMoney(order.invoiceUnitPrice),
     grossProfit: formatMoney(order.grossProfit),
     remark: order.remark,
+    invoiceNo: order.invoiceNo,
+    isPaid: order.isPaid,
     paidTime: order.paidTime,
   })
   editingOrderId.value = order.id
@@ -1212,6 +1919,10 @@ async function deleteOrder(order: Order): Promise<void> {
     ElMessage.warning('该订单已有退货记录')
     return
   }
+  if (data.invoices.some((invoice) => invoice.lines.some((line) => line.orderId === order.id))) {
+    ElMessage.warning('该出库单已关联发票')
+    return
+  }
   if (!(await confirmDanger(`确认删除订单“${order.productName} / ${order.customerUnit}”？`, '删除订单'))) {
     return
   }
@@ -1219,12 +1930,193 @@ async function deleteOrder(order: Order): Promise<void> {
   markSaved('订单已删除')
 }
 
+function invoiceLineFromOrder(order: Order): InvoiceLine {
+  const invoicedAmount = data.invoices.reduce(
+    (sum, invoice) => sum + invoice.lines.filter((line) => line.orderId === order.id).reduce((lineSum, line) => lineSum + Number(line.invoiceAmount || 0), 0),
+    0,
+  )
+  const remainingAmount = Math.max(order.invoiceTotal - invoicedAmount, 0)
+  return {
+    id: createId(),
+    orderId: order.id,
+    orderNo: order.orderNo,
+    productName: order.productName,
+    itemNo: order.itemNo,
+    customerUnit: order.customerUnit,
+    customerName: order.customerName,
+    orderAmount: order.invoiceTotal,
+    invoiceAmount: remainingAmount || order.invoiceTotal,
+  }
+}
+
+function invoiceLineFromImportedOrder(order: Order): InvoiceLine {
+  return {
+    id: createId(),
+    orderId: order.id,
+    orderNo: order.orderNo,
+    productName: order.productName,
+    itemNo: order.itemNo,
+    customerUnit: order.customerUnit,
+    customerName: order.customerName,
+    orderAmount: order.invoiceTotal,
+    invoiceAmount: order.invoiceTotal,
+  }
+}
+
+function isImportInvoiceStatusInvoiced(value: string | undefined): boolean {
+  const text = String(value ?? '').trim()
+  return ['已开票', '全部开票', '部分开票'].includes(text)
+}
+
+function upsertInvoiceFromImportedOrder(order: Order): boolean {
+  const invoiceNo = order.invoiceNo.trim()
+  if (!invoiceNo || !isImportInvoiceStatusInvoiced(order.invoiceStatus)) {
+    return false
+  }
+
+  const existing = data.invoices.find((invoice) => identity(invoice.invoiceNo) === identity(invoiceNo))
+  if (existing) {
+    if (!existing.lines.some((line) => line.orderId === order.id)) {
+      existing.lines.push(invoiceLineFromImportedOrder(order))
+    }
+    existing.totalAmount = existing.lines.reduce((sum, line) => sum + Number(line.invoiceAmount || 0), 0)
+    existing.isPaid = existing.isPaid || order.isPaid
+    existing.paidTime = existing.isPaid ? [existing.paidTime, order.paidTime].filter(Boolean).sort().at(-1) ?? '' : ''
+    return false
+  }
+
+  data.invoices.push({
+    id: createId(),
+    invoiceNo,
+    invoiceDate: order.orderTime || todayString(),
+    isPaid: order.isPaid,
+    paidTime: order.isPaid ? order.paidTime || todayString() : '',
+    totalAmount: order.invoiceTotal,
+    remark: '出库单导入自动创建',
+    lines: [invoiceLineFromImportedOrder(order)],
+    createdAt: nowString(),
+  })
+  return true
+}
+
+function formatInvoiceLineSummary(lines: InvoiceLine[]): string {
+  return [...new Set(lines.map((line) => line.orderNo).filter(Boolean))].join('；')
+}
+
+function openInvoiceCreateFromSelectedOrders(): void {
+  if (!selectedOrders.value.length) {
+    ElMessage.warning('请先选择要开票的出库单')
+    return
+  }
+  Object.assign(invoiceForm, blankInvoiceForm())
+  invoiceForm.lines = selectedOrders.value.map(invoiceLineFromOrder)
+  editingInvoiceId.value = null
+  invoiceDialogVisible.value = true
+  activePage.value = 'invoices'
+}
+
+function editInvoice(invoice: Invoice): void {
+  Object.assign(invoiceForm, {
+    invoiceNo: invoice.invoiceNo,
+    invoiceDate: invoice.invoiceDate,
+    isPaid: invoice.isPaid,
+    paidTime: invoice.paidTime,
+    remark: invoice.remark,
+    lines: invoice.lines.map((line) => ({ ...line })),
+  })
+  editingInvoiceId.value = invoice.id
+  invoiceDialogVisible.value = true
+  activePage.value = 'invoices'
+}
+
+function removeInvoiceLine(lineId: string): void {
+  if (invoiceForm.lines.length <= 1) {
+    ElMessage.warning('至少保留一条出库单明细')
+    return
+  }
+  invoiceForm.lines = invoiceForm.lines.filter((line) => line.id !== lineId)
+}
+
+function buildInvoice(id: string, createdAt: string): Invoice {
+  const invoiceNo = invoiceForm.invoiceNo.trim()
+  const invoiceDate = normalizeDate(invoiceForm.invoiceDate)
+  if (!invoiceNo) {
+    throw new Error('发票号不能为空')
+  }
+  if (!invoiceDate) {
+    throw new Error('开票日期不能为空')
+  }
+  if (!invoiceForm.lines.length) {
+    throw new Error('请至少选择一张出库单')
+  }
+  const lines = invoiceForm.lines.map((line, index) => {
+    const invoiceAmount = Number(line.invoiceAmount)
+    if (!Number.isFinite(invoiceAmount) || invoiceAmount < 0) {
+      throw new Error(`第 ${index + 1} 行发票金额无效`)
+    }
+    return {
+      ...line,
+      invoiceAmount,
+    }
+  })
+  const totalAmount = lines.reduce((sum, line) => sum + line.invoiceAmount, 0)
+  const paidTime = invoiceForm.isPaid ? normalizeDate(invoiceForm.paidTime) || todayString() : ''
+  return {
+    id,
+    invoiceNo,
+    invoiceDate,
+    isPaid: invoiceForm.isPaid,
+    paidTime,
+    totalAmount,
+    remark: invoiceForm.remark.trim(),
+    lines,
+    createdAt,
+  }
+}
+
+function saveInvoice(): void {
+  safeAction(() => {
+    if (editingInvoiceId.value) {
+      const existing = data.invoices.find((invoice) => invoice.id === editingInvoiceId.value)
+      if (!existing) {
+        throw new Error('要编辑的发票不存在')
+      }
+      data.invoices.splice(data.invoices.indexOf(existing), 1, buildInvoice(existing.id, existing.createdAt))
+      syncInvoiceBackfills()
+      resetInvoiceForm()
+      markSaved('发票已更新，出库单状态已同步')
+      return
+    }
+
+    data.invoices.push(buildInvoice(createId(), nowString()))
+    syncInvoiceBackfills()
+    resetInvoiceForm()
+    markSaved('发票已生成，出库单状态已同步')
+  })
+}
+
+async function deleteInvoice(invoice: Invoice): Promise<void> {
+  if (!(await confirmDanger(`确认删除发票“${invoice.invoiceNo}”？`, '删除发票'))) {
+    return
+  }
+  data.invoices = data.invoices.filter((item) => item.id !== invoice.id)
+  syncInvoiceBackfills()
+  markSaved('发票已删除，出库单状态已同步')
+}
+
+function resetInvoiceForm(): void {
+  editingInvoiceId.value = null
+  Object.assign(invoiceForm, blankInvoiceForm())
+  invoiceForm.lines = []
+  invoiceDialogVisible.value = false
+}
+
 function handleOrderSelectionChange(selection: Order[]): void {
   selectedOrders.value = selection
 }
 
 function printOrder(order: Order): void {
-  printOrders([order])
+  void printOrders([order])
 }
 
 function printSelectedOrders(): void {
@@ -1232,58 +2124,216 @@ function printSelectedOrders(): void {
     ElMessage.warning('请先选择要打印的订单')
     return
   }
-  printOrders(selectedOrders.value)
+  void printOrders(selectedOrders.value)
 }
 
-function printOrders(orders: Order[]): void {
-  const frame = document.createElement('iframe')
-  frame.title = '出库单打印'
-  frame.style.position = 'fixed'
-  frame.style.right = '0'
-  frame.style.bottom = '0'
-  frame.style.width = '0'
-  frame.style.height = '0'
-  frame.style.border = '0'
-  frame.style.opacity = '0'
-  frame.style.pointerEvents = 'none'
-  document.body.appendChild(frame)
+async function printOrders(orders: Order[]): Promise<void> {
+  if (isPrinting.value) {
+    ElMessage.warning('正在处理上一份出库单打印')
+    return
+  }
+  isPrinting.value = true
+  try {
+    if (isTauriRuntime()) {
+      printOrdersInCurrentWindow(orders)
+      return
+    }
+    printOrdersInBrowser(orders)
+  } finally {
+    isPrinting.value = false
+  }
+}
 
-  const printDocument = frame.contentDocument ?? frame.contentWindow?.document
-  const printWindow = frame.contentWindow
+function printOrdersInBrowser(orders: Order[]): void {
+  const printWindow = window.open('', '_blank', 'popup=yes,width=900,height=700')
+  const printDocument = printWindow?.document
   if (!printDocument || !printWindow) {
-    frame.remove()
-    ElMessage.error('打印组件初始化失败，请重试')
+    printOrdersInCurrentWindow(orders)
     return
   }
 
   const cleanup = () => {
     setTimeout(() => {
-      frame.remove()
+      printWindow.close()
     }, 300)
   }
 
+  const previousTitle = document.title
+  document.title = '\u200B'
   printDocument.open()
   printDocument.write(buildDeliveryPrintHtml(orders))
   printDocument.close()
+  printDocument.title = '\u200B'
 
-  printWindow.addEventListener('afterprint', cleanup, { once: true })
+  printWindow.addEventListener('afterprint', () => {
+    document.title = previousTitle
+    cleanup()
+  }, { once: true })
   setTimeout(() => {
     printWindow.focus()
     printWindow.print()
-    setTimeout(cleanup, 5000)
+    setTimeout(() => {
+      document.title = previousTitle
+      cleanup()
+    }, 5000)
   }, 300)
-  statusMessage.value = `已发送 ${orders.length} 张出库单到打印`
+  statusMessage.value = `已发送 ${orders.length} 条明细到 1 张出库单打印`
+}
+
+function printOrdersInCurrentWindow(orders: Order[]): void {
+  const profile = activePrintProfile.value
+  const { root, style } = mountBrowserPrintContent(orders, profile)
+  const cleanup = () => {
+    setTimeout(() => {
+      root.remove()
+      style.remove()
+    }, 300)
+  }
+
+  const previousTitle = document.title
+  document.title = '\u200B'
+  window.addEventListener('afterprint', () => {
+    document.title = previousTitle
+    cleanup()
+  }, { once: true })
+
+  void nextTick()
+    .then(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())))
+    .then(() => {
+      window.print()
+      setTimeout(() => {
+        document.title = previousTitle
+        cleanup()
+      }, 5000)
+      statusMessage.value = `已发送 ${orders.length} 条明细到浏览器打印`
+    })
+}
+
+function mountBrowserPrintContent(orders: Order[], profile: PrintProfile): { root: HTMLDivElement; style: HTMLStyleElement } {
+  const root = document.createElement('div')
+  root.id = 'browser-delivery-print-root'
+  root.innerHTML = buildDeliveryPrintPage(orders, profile, printContentSettings)
+
+  const style = document.createElement('style')
+  style.dataset.browserDeliveryPrint = 'true'
+  style.textContent = `
+    #browser-delivery-print-root { display: none; }
+    @page { size: ${profile.pageSize}; margin: 0; }
+    @media print {
+      @page { size: ${profile.pageSize}; margin: 0; }
+      html,
+      body {
+        margin: 0 !important;
+        padding: 0 !important;
+        background: #fff !important;
+      }
+      body > *:not(#browser-delivery-print-root) {
+        display: none !important;
+      }
+      #browser-delivery-print-root {
+        display: block !important;
+        color: #000 !important;
+        background: #fff !important;
+        font-family: "SimSun", "宋体", serif !important;
+      }
+      #browser-delivery-print-root * { box-sizing: border-box; }
+      #browser-delivery-print-root .sheet {
+        width: ${profile.sheetWidth};
+        max-width: 100%;
+        min-height: ${profile.sheetMinHeight};
+        margin: 0 auto;
+        page-break-after: always;
+        padding: ${profile.margin} 0;
+        overflow: hidden;
+      }
+      #browser-delivery-print-root .sheet:last-child { page-break-after: auto; }
+      #browser-delivery-print-root .delivery-title {
+        position: relative;
+        padding: 0 4mm 2mm;
+        text-align: center;
+      }
+      #browser-delivery-print-root .delivery-title h1 {
+        margin: 0;
+        font-size: ${profile.titleSize};
+        line-height: 1.38;
+        font-weight: 700;
+        letter-spacing: 0;
+      }
+      #browser-delivery-print-root .delivery-title h2 {
+        margin: 1mm 0 0;
+        font-size: ${profile.subtitleSize};
+        line-height: 1.35;
+        font-weight: 700;
+        letter-spacing: 0;
+      }
+      #browser-delivery-print-root .order-no {
+        position: absolute;
+        right: 1mm;
+        bottom: 3mm;
+        font-size: ${profile.orderNoSize};
+        font-weight: 700;
+      }
+      #browser-delivery-print-root table {
+        width: 100%;
+        border-collapse: collapse;
+        table-layout: fixed;
+        font-size: ${profile.tableFontSize};
+      }
+      #browser-delivery-print-root td,
+      #browser-delivery-print-root th {
+        border: 1px solid #000;
+        height: ${profile.cellHeight};
+        padding: 1.2mm 1.5mm;
+        text-align: center;
+        vertical-align: middle;
+        font-weight: 400;
+        overflow-wrap: anywhere;
+      }
+      #browser-delivery-print-root .label {
+        width: 23mm;
+        font-weight: 400;
+      }
+      #browser-delivery-print-root .head-cell {
+        font-size: ${profile.tableFontSize};
+        font-weight: 400;
+      }
+      #browser-delivery-print-root .text-left { text-align: left; }
+      #browser-delivery-print-root .money {
+        text-align: right;
+        padding-right: 3mm;
+        font-family: "Courier New", monospace;
+      }
+      #browser-delivery-print-root .item-row td { height: ${profile.itemRowHeight}; }
+      #browser-delivery-print-root .blank-row td { height: ${profile.blankRowHeight}; }
+      #browser-delivery-print-root .footer td { height: ${profile.cellHeight}; }
+      #browser-delivery-print-root .signature {
+        height: ${profile.signatureHeight};
+        text-align: center;
+        line-height: 1.8;
+        font-size: ${profile.tableFontSize};
+      }
+    }
+  `
+
+  document.head.appendChild(style)
+  document.body.appendChild(root)
+  return { root, style }
 }
 
 function buildDeliveryPrintHtml(orders: Order[]): string {
-  const pages = orders.map((order, index) => buildDeliveryPrintPage(order, index, orders.length)).join('')
+  const profile = activePrintProfile.value
+  const page = buildDeliveryPrintPage(orders, profile, printContentSettings)
   return `<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>出库单打印</title>
+  <title>&#8203;</title>
   <style>
-    @page { size: A4 landscape; margin: 6mm; }
+    @page { size: ${profile.pageSize}; margin: 0; }
+    @media print {
+      @page { size: ${profile.pageSize}; margin: 0 !important; }
+      html, body { margin: 0 !important; padding: 0 !important; }
+    }
     * { box-sizing: border-box; }
     body {
       margin: 0;
@@ -1292,12 +2342,12 @@ function buildDeliveryPrintHtml(orders: Order[]): string {
       font-family: "SimSun", "宋体", serif;
     }
     .sheet {
-      width: 268mm;
+      width: ${profile.sheetWidth};
       max-width: 100%;
-      min-height: 186mm;
+      min-height: ${profile.sheetMinHeight};
       margin: 0 auto;
       page-break-after: always;
-      padding: 0;
+      padding: ${profile.margin} 0;
       overflow: hidden;
     }
     .sheet:last-child { page-break-after: auto; }
@@ -1308,14 +2358,14 @@ function buildDeliveryPrintHtml(orders: Order[]): string {
     }
     .delivery-title h1 {
       margin: 0;
-      font-size: 18pt;
+      font-size: ${profile.titleSize};
       line-height: 1.38;
       font-weight: 700;
       letter-spacing: 0;
     }
     .delivery-title h2 {
       margin: 1mm 0 0;
-      font-size: 15.5pt;
+      font-size: ${profile.subtitleSize};
       line-height: 1.35;
       font-weight: 700;
       letter-spacing: 0;
@@ -1324,18 +2374,18 @@ function buildDeliveryPrintHtml(orders: Order[]): string {
       position: absolute;
       right: 1mm;
       bottom: 3mm;
-      font-size: 13.5pt;
+      font-size: ${profile.orderNoSize};
       font-weight: 700;
     }
     table {
       width: 100%;
       border-collapse: collapse;
       table-layout: fixed;
-      font-size: 13pt;
+      font-size: ${profile.tableFontSize};
     }
     td, th {
       border: 1px solid #000;
-      height: 12.5mm;
+      height: ${profile.cellHeight};
       padding: 1.2mm 1.5mm;
       text-align: center;
       vertical-align: middle;
@@ -1347,44 +2397,32 @@ function buildDeliveryPrintHtml(orders: Order[]): string {
       font-weight: 400;
     }
     .head-cell {
-      font-size: 12.8pt;
+      font-size: ${profile.tableFontSize};
       font-weight: 400;
     }
     .text-left { text-align: left; }
     .money { text-align: right; padding-right: 3mm; font-family: "Courier New", monospace; }
-    .item-row td { height: 17mm; }
-    .blank-row td { height: 12.5mm; }
-    .footer td { height: 12.5mm; }
+    .item-row td { height: ${profile.itemRowHeight}; }
+    .blank-row td { height: ${profile.blankRowHeight}; }
+    .footer td { height: ${profile.cellHeight}; }
     .signature {
-      height: 20mm;
+      height: ${profile.signatureHeight};
       text-align: center;
       line-height: 1.8;
-      font-size: 13pt;
+      font-size: ${profile.tableFontSize};
     }
   </style>
 </head>
-<body>${pages}</body>
+<body>${page}</body>
 </html>`
 }
 
-function buildDeliveryPrintPage(order: Order, index: number, total: number): string {
-  const product = data.products.find((item) => item.id === order.productId)
-  const itemName = [order.productName, product?.specification].filter(Boolean).join(' ')
-  const amount = order.invoiceTotal
-  const row = `
-    <tr class="item-row">
-      <td>${escapeHtml(order.brand || '-')}</td>
-      <td>${escapeHtml(order.itemNo || '-')}</td>
-      <td>${escapeHtml(itemName || '-')}</td>
-      <td>${escapeHtml(order.unit || '-')}</td>
-      <td>${formatMoney(order.quantity)}</td>
-      <td></td>
-      <td>普通舱</td>
-      <td></td>
-      <td class="money">${formatMoney(order.invoiceUnitPrice)}</td>
-      <td class="money">${formatMoney(amount)}</td>
-    </tr>`
-  const blanks = Array.from({ length: 5 }, () => `
+function buildDeliveryPrintPage(orders: Order[], profile: PrintProfile, settings: PrintContentSettings): string {
+  const firstOrder = orders[0]
+  const rows = orders.map((order) => buildDeliveryPrintItemRow(order, settings)).join('')
+  const amount = orders.reduce((sum, order) => sum + order.invoiceTotal, 0)
+  const blankRowCount = Math.max(profile.blankRows - orders.length + 1, 0)
+  const blanks = Array.from({ length: blankRowCount }, () => `
     <tr class="blank-row">
       <td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td>
     </tr>`).join('')
@@ -1392,9 +2430,9 @@ function buildDeliveryPrintPage(order: Order, index: number, total: number): str
   return `
   <section class="sheet">
     <div class="delivery-title">
-      <h1>武汉维优诺生物科技有限公司</h1>
-      <h2>送（销）货单</h2>
-      <div class="order-no">No:${escapeHtml(buildPrintOrderNo(order, index, total))}</div>
+      <h1>${escapeHtml(settings.companyName)}</h1>
+      <h2>${escapeHtml(settings.documentTitle)}</h2>
+      <div class="order-no">${escapeHtml(settings.orderNoPrefix)}${escapeHtml(buildPrintOrderNo(firstOrder))}</div>
     </div>
     <table>
       <colgroup>
@@ -1411,13 +2449,13 @@ function buildDeliveryPrintPage(order: Order, index: number, total: number): str
       </colgroup>
       <tr>
         <td class="label">单位</td>
-        <td colspan="2">${escapeHtml(order.customerUnit || '')}</td>
+        <td colspan="2">${escapeHtml(firstOrder.customerUnit || '')}</td>
         <td colspan="2">开单日期</td>
-        <td colspan="5">${escapeHtml(formatPrintDate(order.deliveryDate))}</td>
+        <td colspan="5">${escapeHtml(formatPrintDate(firstOrder.deliveryDate || firstOrder.orderTime))}</td>
       </tr>
       <tr>
         <td class="label">订货人</td>
-        <td colspan="2">${escapeHtml(order.customerName || '')}</td>
+        <td colspan="2">${escapeHtml(firstOrder.customerName || '')}</td>
         <td colspan="7">地址</td>
       </tr>
       <tr>
@@ -1432,7 +2470,7 @@ function buildDeliveryPrintPage(order: Order, index: number, total: number): str
         <td class="head-cell">单价</td>
         <td class="head-cell">总额</td>
       </tr>
-      ${row}
+      ${rows}
       ${blanks}
       <tr class="footer">
         <td colspan="2">合计</td>
@@ -1444,8 +2482,8 @@ function buildDeliveryPrintPage(order: Order, index: number, total: number): str
       </tr>
       <tr>
         <td colspan="3" class="signature">  
-          <div>收货人签名:</div>
-          <div>（“货物”“发票”已收到）</div>
+          <div>${escapeHtml(settings.receiverSignatureLabel)}</div>
+          <div>${escapeHtml(settings.receiverSignatureHint)}</div>
         </td>
         <td colspan="7"></td>
       </tr>
@@ -1453,10 +2491,27 @@ function buildDeliveryPrintPage(order: Order, index: number, total: number): str
   </section>`
 }
 
-function buildPrintOrderNo(order: Order, index: number, total: number): string {
-  const dateText = (normalizeDate(order.deliveryDate) || todayString()).replaceAll('-', '')
-  const suffix = total > 1 ? index + 1 : 1
-  return `000-${dateText}${suffix}`
+function buildDeliveryPrintItemRow(order: Order, settings: PrintContentSettings): string {
+  const product = data.products.find((item) => item.id === order.productId)
+  const itemName = [order.productName, product?.specification].filter(Boolean).join(' ')
+  return `
+    <tr class="item-row">
+      <td>${escapeHtml(order.brand || '-')}</td>
+      <td>${escapeHtml(order.itemNo || '-')}</td>
+      <td>${escapeHtml(itemName || '-')}</td>
+      <td>${escapeHtml(order.unit || '-')}</td>
+      <td>${formatMoney(order.quantity)}</td>
+      <td></td>
+      <td>${escapeHtml(settings.warehouseName)}</td>
+      <td></td>
+      <td class="money">${formatMoney(order.invoiceUnitPrice)}</td>
+      <td class="money">${formatMoney(order.invoiceTotal)}</td>
+    </tr>`
+}
+
+function buildPrintOrderNo(order: Order): string {
+  const dateText = (normalizeDate(order.deliveryDate) || normalizeDate(order.orderTime) || todayString()).replaceAll('-', '')
+  return `000-${dateText}1`
 }
 
 function formatPrintDate(value: string): string {
@@ -1774,7 +2829,10 @@ function importTypeLabel(type: ImportType): string {
     return '产品'
   }
   if (type === 'orders') {
-    return '下单'
+    return '出库单'
+  }
+  if (type === 'invoices') {
+    return '发票'
   }
   return '退货'
 }
@@ -1876,44 +2934,122 @@ async function importOrdersExcel(event: Event): Promise<void> {
   }
   safeAction(() => {
     let imported = 0
+    let skipped = 0
+    let createdProducts = 0
+    let createdCustomers = 0
+    let createdInvoices = 0
+    let linkedInvoices = 0
+    const importedOrderKeys = new Set(data.orders.map(orderImportKey))
     for (const row of rows) {
-      const productName = row['产品名称']?.trim()
+      const productName = (row['品名'] || row['产品名称'] || '').trim()
       if (!productName) {
         continue
       }
-      const product = data.products.find(
-        (item) => identity(item.name) === identity(productName) && identity(item.brand) === identity(row['品牌'] ?? ''),
-      )
-      data.orders.push({
-        id: createId(),
-        productId: product?.id ?? null,
-        customerId: findCustomerIdByText(data.customers, row['订货单位'] ?? '', row['订货人'] ?? ''),
+      const orderTime = normalizeDate(row['订购时间'] ?? '') || todayString()
+      const brand = (row['品牌'] ?? '').trim()
+      const unit = (row['单位'] ?? '').trim() || '件'
+      const rawItemNo = (row['货号'] ?? '').trim()
+      const existingProduct = findProductForOrderImport(productName, brand, rawItemNo)
+      const itemNo = rawItemNo || existingProduct?.specification || ''
+      const orderNoPrefix = itemNo || productName
+      const invoiceUnitPrice = parseNonNegative('开票单价', row['开票单价'] ?? row['销售单价'] ?? '0')
+      const costUnitPrice = parseNonNegative('成本单价', row['成本单价'] ?? '0')
+      const quantity = parsePositive('数量', row['数量'] ?? '0')
+      const cashback = parseImportCashback(row['返现'])
+      const invoiceTotal = quantity * invoiceUnitPrice
+      const costTotal = quantity * costUnitPrice
+      const grossProfit = invoiceTotal - costTotal - cashback
+      const orderMonth = normalizeImportMonth(row['月份'], orderTime)
+      const catalogPrice = parseNonNegative('目录价', row['目录价'] ?? '0')
+      const costDiscount = parseNonNegative('成本折扣', row['成本折扣'] ?? '0')
+      const saleDiscount = parseNonNegative('售价折扣', row['售价折扣'] ?? '0')
+      const isShipped = parseYesNo(row['是否发货'], true)
+      const returnedQuantity = parseNonNegative('已退数量', row['已退数量'] ?? '0')
+      const remark = row['备注'] ?? ''
+      const invoiceNo = row['发票号'] ?? ''
+      const orderKey = orderImportKey({
+        month: orderMonth,
         productName,
-        itemNo: row['货号'] ?? '',
-        orderTime: normalizeDate(row['订购时间'] ?? '') || todayString(),
-        deliveryDate: normalizeDate(row['出库日期'] ?? '') || todayString(),
+        itemNo,
+        orderTime,
         customerUnit: row['订货单位'] ?? '',
         customerName: row['订货人'] ?? '',
-        brand: row['品牌'] ?? '',
-        unit: row['单位'] || '件',
-        catalogPrice: parseNonNegative('目录价', row['目录价'] ?? '0'),
-        quantity: parsePositive('数量', row['数量'] ?? '0'),
-        invoiceTotal: parseNonNegative('销售总价', row['销售总价'] ?? '0'),
-        cashback: parseNonNegative('返现', row['返现'] ?? '0'),
-        costDiscount: parseNonNegative('成本折扣', row['成本折扣'] ?? '0'),
-        costUnitPrice: parseNonNegative('成本单价', row['成本单价'] ?? '0'),
-        costTotal: parseNonNegative('成本总价', row['成本总价'] ?? '0'),
-        saleDiscount: parseNonNegative('售价折扣', row['售价折扣'] ?? '0'),
-        invoiceUnitPrice: parseNonNegative('销售单价', row['销售单价'] ?? '0'),
-        grossProfit: parseAmount(row['毛利'] ?? '0'),
-        remark: row['备注'] ?? '',
-        paidTime: todayString(),
-        returnedQuantity: parseNonNegative('已退数量', row['已退数量'] ?? '0'),
-        createdAt: row['创建时间'] || nowString(),
+        brand,
+        unit,
+        catalogPrice,
+        quantity,
+        cashback,
+        costDiscount,
+        costUnitPrice,
+        saleDiscount,
+        invoiceUnitPrice,
+        remark,
+        invoiceNo,
+        isShipped,
+        returnedQuantity,
       })
+      if (importedOrderKeys.has(orderKey)) {
+        skipped += 1
+        continue
+      }
+
+      const product = ensureProductForOrderImport(productName, brand, itemNo, unit, costUnitPrice, invoiceUnitPrice)
+      if (!existingProduct) {
+        createdProducts += 1
+      }
+
+      const customerUnit = (row['订货单位'] ?? '').trim()
+      const customerName = (row['订货人'] ?? '').trim()
+      const existingCustomerId = findCustomerIdByText(data.customers, customerUnit, customerName)
+      const customer = ensureCustomerForOrderImport(customerUnit, customerName)
+      if (!existingCustomerId && customer) {
+        createdCustomers += 1
+      }
+
+      const order: Order = {
+        id: createId(),
+        orderNo: generateOrderNo(orderNoPrefix),
+        productId: product?.id ?? null,
+        customerId: customer?.id ?? null,
+        month: orderMonth,
+        productName,
+        itemNo,
+        orderTime,
+        deliveryDate: orderTime,
+        customerUnit,
+        customerName,
+        brand,
+        unit,
+        catalogPrice,
+        quantity,
+        invoiceTotal,
+        invoiceStatus: row['开票情况'] || '未开票',
+        isShipped,
+        cashback,
+        costDiscount,
+        costUnitPrice,
+        costTotal,
+        saleDiscount,
+        invoiceUnitPrice,
+        grossProfit,
+        remark,
+        invoiceNo,
+        isPaid: parseYesNo(row['是否回款'], false),
+        paidTime: normalizeDate(row['回款时间'] ?? '') || '',
+        returnedQuantity,
+        createdAt: row['创建时间'] || nowString(),
+      }
+      data.orders.push(order)
+      importedOrderKeys.add(orderKey)
+      if (upsertInvoiceFromImportedOrder(order)) {
+        createdInvoices += 1
+      } else if (order.invoiceNo.trim() && isImportInvoiceStatusInvoiced(order.invoiceStatus)) {
+        linkedInvoices += 1
+      }
       imported += 1
     }
-    markSaved(`订单Excel已导入 ${imported} 条`)
+    syncInvoiceBackfills()
+    markSaved(`订单Excel已导入 ${imported} 条，跳过重复 ${skipped} 条，自动创建产品 ${createdProducts} 个、客户 ${createdCustomers} 个、发票 ${createdInvoices} 张、关联发票 ${linkedInvoices} 条`)
     importDialogVisible.value = false
   })
 }
@@ -2000,6 +3136,9 @@ function importTemplateHeaders(type: ImportType): string[] {
   if (type === 'orders') {
     return ORDER_HEADERS
   }
+  if (type === 'invoices') {
+    return INVOICE_HEADERS
+  }
   return RETURN_HEADERS
 }
 
@@ -2008,7 +3147,11 @@ async function exportProductsExcel(): Promise<void> {
 }
 
 async function exportOrdersExcel(): Promise<void> {
-  await exportSingleSheetExcel('订单', ORDER_HEADERS, orderExportRows(), '订单.xlsx', '订单Excel已导出')
+  await exportSingleSheetExcel('出库单', ORDER_HEADERS, orderExportRows(), '出库单.xlsx', '出库单Excel已导出')
+}
+
+async function exportInvoicesExcel(): Promise<void> {
+  await exportSingleSheetExcel('发票', INVOICE_HEADERS, invoiceExportRows(), '发票.xlsx', '发票Excel已导出')
 }
 
 async function exportReturnsExcel(): Promise<void> {
@@ -2049,17 +3192,19 @@ function productExportRows(): Array<Array<string | number>> {
 
 function orderExportRows(): Array<Array<string | number>> {
   return data.orders.map((order) => [
-    order.productName,
-    order.itemNo,
+    order.month || monthFromDate(order.orderTime),
     order.orderTime,
-    order.deliveryDate,
     order.customerUnit,
     order.customerName,
     order.brand,
+    order.itemNo,
+    order.productName,
     order.unit,
     formatMoney(order.catalogPrice),
     formatMoney(order.quantity),
     formatMoney(order.invoiceTotal),
+    order.invoiceStatus,
+    yesNo(order.isShipped),
     formatMoney(order.cashback),
     formatMoney(order.costDiscount),
     formatMoney(order.costUnitPrice),
@@ -2068,8 +3213,22 @@ function orderExportRows(): Array<Array<string | number>> {
     formatMoney(order.invoiceUnitPrice),
     formatMoney(order.grossProfit),
     order.remark,
-    formatMoney(order.returnedQuantity),
-    order.createdAt,
+    order.invoiceNo,
+    yesNo(order.isPaid),
+    order.paidTime,
+  ])
+}
+
+function invoiceExportRows(): Array<Array<string | number>> {
+  return data.invoices.map((invoice) => [
+    invoice.invoiceNo,
+    invoice.invoiceDate,
+    formatMoney(invoice.totalAmount),
+    yesNo(invoice.isPaid),
+    invoice.paidTime,
+    invoice.lines.map((line) => `${line.orderNo}:${formatMoney(line.invoiceAmount)}`).join('; '),
+    invoice.remark,
+    invoice.createdAt,
   ])
 }
 
@@ -2114,7 +3273,15 @@ async function exportAllExcel(): Promise<void> {
       ORDER_HEADERS,
       ...orderExportRows(),
     ]),
-    '订单',
+    '出库单',
+  )
+  XLSX.utils.book_append_sheet(
+    workbook,
+    XLSX.utils.aoa_to_sheet([
+      INVOICE_HEADERS,
+      ...invoiceExportRows(),
+    ]),
+    '发票',
   )
   XLSX.utils.book_append_sheet(
     workbook,
@@ -2241,11 +3408,51 @@ function setDashboardRange(type: 'today' | 'week' | 'month'): void {
   }
 }
 
-function barWidth(value: number): string {
-  if (value <= 0) {
-    return '0%'
+function percentOf(value: number, base: number): number {
+  return Math.abs(base) > 0 ? value / base : 0
+}
+
+function formatPercent(value: number): string {
+  return `${(value * 100).toFixed(1)}%`
+}
+
+function formatChartMoney(value: number): string {
+  const sign = value < 0 ? '-' : ''
+  const amount = Math.abs(value)
+  if (amount >= 10000) {
+    return `${sign}¥${(amount / 10000).toFixed(1)}万`
   }
-  return `${Math.max(4, (value / maxDailyAmount.value) * 100)}%`
+  return `${sign}¥${formatMoney(amount)}`
+}
+
+function chartValueY(value: number): number {
+  const scaleRange = chartScaleMax.value - chartScaleMin.value
+  const ratio = scaleRange > 0 ? (value - chartScaleMin.value) / scaleRange : 0
+  return CHART_PADDING.top + chartInnerHeight * (1 - Math.min(Math.max(ratio, 0), 1))
+}
+
+function makeChartPoints(series: DashboardDailyStat[], pickValue: (item: DashboardDailyStat) => number): ChartPoint[] {
+  if (series.length === 0) {
+    return []
+  }
+  return series.map((item, index) => {
+    const x = series.length === 1
+      ? CHART_PADDING.left
+      : CHART_PADDING.left + (chartInnerWidth * index) / (series.length - 1)
+    const value = pickValue(item)
+    return {
+      x,
+      y: chartValueY(value),
+      value,
+      label: item.label,
+    }
+  })
+}
+
+function makeLinePath(points: ChartPoint[]): string {
+  return points
+    .map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`)
+    .join(' ')
 }
 </script>
 
@@ -2300,9 +3507,13 @@ function barWidth(value: number): string {
       </el-header>
 
       <el-main class="workspace">
-        <section v-if="activePage === 'dashboard'" class="page-stack">
-          <div class="toolbar-band">
+        <section v-if="activePage === 'dashboard'" class="page-stack dashboard-page">
+          <div class="toolbar-band dashboard-toolbar">
             <div class="toolbar-left">
+              <div class="dashboard-toolbar-title">
+                <strong>经营看板</strong>
+                <span>利润 / 退货 / 回款</span>
+              </div>
               <el-date-picker v-model="dashboardFilter.startDate" type="date" value-format="YYYY-MM-DD" />
               <span class="date-separator">至</span>
               <el-date-picker v-model="dashboardFilter.endDate" type="date" value-format="YYYY-MM-DD" />
@@ -2315,62 +3526,208 @@ function barWidth(value: number): string {
           </div>
 
           <div class="metric-grid">
-            <div class="metric-card">
-              <span>产品数</span>
-              <strong>{{ data.products.length }}</strong>
-              <small>已登记产品</small>
+            <div class="metric-card accent-blue metric-primary">
+              <span>累计净销售额</span>
+              <strong>¥{{ formatMoney(netAmount) }}</strong>
+              <small>订单金额 - 退货金额</small>
             </div>
-            <div class="metric-card">
-              <span>订单数</span>
-              <strong>{{ data.orders.length }}</strong>
-              <small>累计订单</small>
-            </div>
-            <!-- <div class="metric-card">
-              <span>客户数</span>
-              <strong>{{ data.customers.length }}</strong>
-              <small>已登记客户</small>
-            </div> -->
-            <div class="metric-card">
-              <span>退货记录</span>
-              <strong>{{ data.returns.length }}</strong>
-              <small>累计退货</small>
+            <div class="metric-card accent-green metric-primary">
+              <span>累计净毛利</span>
+              <strong>¥{{ formatMoney(netGrossProfit) }}</strong>
+              <small>毛利率 {{ formatPercent(netGrossProfitRate) }}</small>
             </div>
             <div class="metric-card accent-blue">
-              <span>今日出库</span>
-              <strong>¥{{ formatMoney(todayOutboundAmount) }}</strong>
-              <small>按出库日期</small>
-            </div>
-            <div class="metric-card accent-red">
-              <span>今日退货</span>
-              <strong>¥{{ formatMoney(todayReturnAmount) }}</strong>
-              <small>按退货日期</small>
+              <span>今日净销售额</span>
+              <strong>¥{{ formatMoney(todayNetAmount) }}</strong>
+              <small>今日出库 - 今日退货</small>
             </div>
             <div class="metric-card accent-green">
-              <span>累计金额</span>
-              <strong>¥{{ formatMoney(netAmount) }}</strong>
-              <small>订单减退货</small>
+              <span>今日净毛利</span>
+              <strong>¥{{ formatMoney(todayNetGrossProfit) }}</strong>
+              <small>毛利率 {{ formatPercent(todayNetGrossProfitRate) }}</small>
+            </div>
+            <div class="metric-card accent-red">
+              <span>区间净销售额</span>
+              <strong>¥{{ formatMoney(rangeNetAmount) }}</strong>
+              <small>当前统计范围</small>
+            </div>
+            <div class="metric-card accent-green">
+              <span>区间净毛利</span>
+              <strong>¥{{ formatMoney(rangeGrossProfitAmount) }}</strong>
+              <small>毛利率 {{ formatPercent(rangeGrossProfitRate) }}</small>
             </div>
           </div>
 
-          <div class="panel">
-            <div class="panel-head">
-              <h2>日期趋势</h2>
-              <span>{{ dashboardFilter.startDate }} / {{ dashboardFilter.endDate }}</span>
-            </div>
-            <div class="trend-list">
-              <div v-for="item in dailySeries" :key="item.label" class="trend-row">
-                <span class="trend-date">{{ item.label }}</span>
-                <div class="trend-bars">
-                  <div class="trend-track">
-                    <div class="trend-fill outbound" :style="{ width: barWidth(item.outboundAmount) }" />
-                  </div>
-                  <div class="trend-track">
-                    <div class="trend-fill returns" :style="{ width: barWidth(item.returnAmount) }" />
-                  </div>
+          <div class="dashboard-chart-grid">
+            <div class="panel chart-panel">
+              <div class="panel-head">
+                <div>
+                  <h2>利润趋势</h2>
+                  <p class="panel-subtitle">按日期统计净销售额与净毛利</p>
                 </div>
-                <span class="trend-value">¥{{ formatMoney(item.outboundAmount) }} / ¥{{ formatMoney(item.returnAmount) }}</span>
+                <span>{{ dashboardFilter.startDate }} / {{ dashboardFilter.endDate }}</span>
               </div>
-              <el-empty v-if="dailySeries.length === 0" description="暂无趋势数据" :image-size="96" />
+              <div class="chart-summary">
+                <div>
+                  <span>区间净销售</span>
+                  <strong>¥{{ formatMoney(rangeNetAmount) }}</strong>
+                </div>
+                <div>
+                  <span>区间净毛利</span>
+                  <strong>¥{{ formatMoney(rangeGrossProfitAmount) }}</strong>
+                </div>
+                <div>
+                  <span>毛利率</span>
+                  <strong>{{ formatPercent(rangeGrossProfitRate) }}</strong>
+                </div>
+              </div>
+              <div class="chart-legend">
+                <span><i class="legend-dot outbound" />净销售额 <strong>{{ formatChartMoney(rangeNetAmount) }}</strong></span>
+                <span><i class="legend-dot profit" />净毛利 <strong>{{ formatChartMoney(rangeGrossProfitAmount) }}</strong></span>
+              </div>
+              <div class="line-chart-wrap">
+                <svg
+                  class="line-chart"
+                  :viewBox="`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`"
+                  role="img"
+                  aria-label="日期趋势折线图"
+                >
+                  <g class="chart-grid-lines">
+                    <line
+                      v-for="tick in chartTicks"
+                      :key="tick.y"
+                      :x1="CHART_PADDING.left"
+                      :x2="CHART_WIDTH - CHART_PADDING.right"
+                      :y1="tick.y"
+                      :y2="tick.y"
+                    />
+                  </g>
+                  <line
+                    class="chart-zero-line"
+                    :x1="CHART_PADDING.left"
+                    :x2="CHART_WIDTH - CHART_PADDING.right"
+                    :y1="chartValueY(0)"
+                    :y2="chartValueY(0)"
+                  />
+                  <g class="chart-axis-labels">
+                    <text
+                      v-for="tick in chartTicks"
+                      :key="tick.value"
+                      :x="CHART_PADDING.left - 12"
+                      :y="tick.y + 4"
+                      text-anchor="end"
+                    >
+                      {{ formatChartMoney(tick.value) }}
+                    </text>
+                    <text
+                      v-for="label in chartLabels"
+                      :key="label.label"
+                      :x="label.x"
+                      :y="CHART_HEIGHT - 12"
+                      text-anchor="middle"
+                    >
+                      {{ label.label }}
+                    </text>
+                  </g>
+                  <path v-if="chartAreaPath" class="line-area outbound" :d="chartAreaPath" />
+                  <path v-if="netSalesChartPath" class="line-path outbound" :d="netSalesChartPath" />
+                  <path v-if="grossProfitChartPath" class="line-path profit" :d="grossProfitChartPath" />
+                  <g class="chart-points outbound">
+                    <circle
+                      v-for="point in netSalesChartPoints"
+                      :key="`net-sales-${point.label}`"
+                      :cx="point.x"
+                      :cy="point.y"
+                      r="4"
+                    >
+                      <title>{{ point.label }} 净销售额 ¥{{ formatMoney(point.value) }}</title>
+                    </circle>
+                  </g>
+                  <g class="chart-points profit">
+                    <circle
+                      v-for="point in grossProfitChartPoints"
+                      :key="`gross-profit-${point.label}`"
+                      :cx="point.x"
+                      :cy="point.y"
+                      r="4"
+                    >
+                      <title>{{ point.label }} 净毛利 ¥{{ formatMoney(point.value) }}</title>
+                    </circle>
+                  </g>
+                </svg>
+                <el-empty v-if="dailySeries.length === 0" description="暂无趋势数据" :image-size="96" />
+              </div>
+            </div>
+
+            <div class="panel pie-panel">
+              <div class="panel-head">
+                <div>
+                  <h2>金额占比</h2>
+                  <p class="panel-subtitle">当前统计范围</p>
+                </div>
+              </div>
+              <div class="pie-chart-wrap">
+                <svg class="pie-chart" viewBox="0 0 180 180" role="img" aria-label="出库和退货金额占比饼图">
+                  <circle class="pie-ring-bg" cx="90" cy="90" :r="PIE_RADIUS" />
+                  <circle
+                    v-for="slice in pieSlices"
+                    :key="slice.label"
+                    class="pie-slice"
+                    :class="slice.className"
+                    cx="90"
+                    cy="90"
+                    :r="PIE_RADIUS"
+                    :stroke-dasharray="slice.dashArray"
+                    :stroke-dashoffset="slice.dashOffset"
+                  >
+                    <title>{{ slice.label }} {{ Math.round(slice.percent * 100) }}%</title>
+                  </circle>
+                  <text x="90" y="84" text-anchor="middle">净额</text>
+                  <text x="90" y="107" text-anchor="middle">¥{{ formatMoney(rangeNetAmount) }}</text>
+                </svg>
+                <el-empty v-if="!chartHasData" description="暂无占比数据" :image-size="84" />
+              </div>
+              <div class="pie-stats">
+                <div v-for="slice in pieSlices" :key="slice.label" class="pie-stat">
+                  <span><i class="legend-dot" :class="slice.className" />{{ slice.label }}</span>
+                  <strong>{{ Math.round(slice.percent * 100) }}%</strong>
+                  <small>¥{{ formatMoney(slice.value) }}</small>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="analysis-strip">
+            <div class="analysis-item">
+              <span>区间出库金额</span>
+              <strong>¥{{ formatMoney(rangeOutboundAmount) }}</strong>
+            </div>
+            <div class="analysis-item">
+              <span>区间出库数量</span>
+              <strong>{{ formatMoney(rangeOutboundQuantity) }}</strong>
+            </div>
+            <div class="analysis-item">
+              <span>退货冲减</span>
+              <strong>¥{{ formatMoney(rangeReturnAmount) }}</strong>
+              <small>占出库 {{ formatPercent(rangeReturnImpactRate) }}</small>
+            </div>
+            <div class="analysis-item">
+              <span>区间退货数量</span>
+              <strong>{{ formatMoney(rangeReturnQuantity) }}</strong>
+            </div>
+            <div class="analysis-item">
+              <span>区间净销售</span>
+              <strong>¥{{ formatMoney(rangeNetAmount) }}</strong>
+            </div>
+            <div class="analysis-item">
+              <span>区间净毛利</span>
+              <strong>¥{{ formatMoney(rangeGrossProfitAmount) }}</strong>
+              <small>毛利率 {{ formatPercent(rangeGrossProfitRate) }}</small>
+            </div>
+            <div class="analysis-item">
+              <span>发票回款率</span>
+              <strong>{{ formatPercent(rangePaidRate) }}</strong>
+              <small>未回 ¥{{ formatMoney(rangeUnpaidInvoiceAmount) }}</small>
             </div>
           </div>
         </section>
@@ -2381,9 +3738,15 @@ function barWidth(value: number): string {
               <h2>产品列表</h2>
               <div class="panel-actions">
                 <el-input v-model="productQuery" class="search-input" :prefix-icon="Search" clearable placeholder="名称、品牌、规格" />
-                <el-button type="primary" :icon="Plus" @click="openProductCreate">新增产品</el-button>
-                <el-button :icon="Upload" @click="openImportDialog('products')">导入Excel</el-button>
-                <el-button :icon="Download" @click="exportProductsExcel">导出Excel</el-button>
+                <el-tooltip content="新增产品" placement="top">
+                  <el-button class="toolbar-icon-button" type="primary" :icon="Plus" circle @click="openProductCreate" />
+                </el-tooltip>
+                <el-tooltip content="导入Excel" placement="top">
+                  <el-button class="toolbar-icon-button" :icon="Upload" circle @click="openImportDialog('products')" />
+                </el-tooltip>
+                <el-tooltip content="导出Excel" placement="top">
+                  <el-button class="toolbar-icon-button" :icon="Download" circle @click="exportProductsExcel" />
+                </el-tooltip>
                 <input ref="productFileInput" class="file-input" type="file" accept=".xlsx,.xls" @change="importProductsExcel" />
               </div>
             </div>
@@ -2432,7 +3795,9 @@ function barWidth(value: number): string {
               <h2>客户列表</h2>
               <div class="panel-actions">
                 <el-input v-model="customerQuery" class="search-input" :prefix-icon="Search" clearable placeholder="单位、联系人、电话" />
-                <el-button type="primary" :icon="Plus" @click="openCustomerCreate">新增客户</el-button>
+                <el-tooltip content="新增客户" placement="top">
+                  <el-button class="toolbar-icon-button" type="primary" :icon="Plus" circle @click="openCustomerCreate" />
+                </el-tooltip>
               </div>
             </div>
             <div class="summary-strip">
@@ -2474,14 +3839,28 @@ function barWidth(value: number): string {
         <section v-if="activePage === 'orders'" class="page-stack">
           <div class="panel table-panel">
             <div class="panel-head">
-              <h2>订单列表</h2>
+              <h2>出库单列表</h2>
               <div class="panel-actions">
-                <el-input v-model="orderQuery" class="search-input" :prefix-icon="Search" clearable placeholder="产品、货号、单位、订货人" />
+                <el-input v-model="orderQuery" class="search-input" :prefix-icon="Search" clearable placeholder="订单编号、品名、货号、单位、订货人" />
                 <el-date-picker v-model="orderDateRange" class="range-input" type="daterange" value-format="YYYY-MM-DD" range-separator="至" start-placeholder="开始日期" end-placeholder="结束日期" />
-                <el-button type="primary" :icon="Plus" @click="openOrderCreate">新增订单</el-button>
-                <el-button :icon="Printer" :disabled="selectedOrders.length === 0" @click="printSelectedOrders">打印出库单</el-button>
-                <el-button :icon="Upload" @click="openImportDialog('orders')">导入Excel</el-button>
-                <el-button :icon="Download" @click="exportOrdersExcel">导出Excel</el-button>
+                <el-tooltip content="新增出库单" placement="top">
+                  <el-button class="toolbar-icon-button" type="primary" :icon="Plus" circle @click="openOrderCreate" />
+                </el-tooltip>
+                <el-tooltip content="生成发票" placement="top">
+                  <el-button class="toolbar-icon-button" :icon="DocumentAdd" circle :disabled="selectedOrders.length === 0" @click="openInvoiceCreateFromSelectedOrders" />
+                </el-tooltip>
+                <el-tooltip content="打印出库单" placement="top">
+                  <el-button class="toolbar-icon-button" :icon="Printer" circle :disabled="selectedOrders.length === 0 || isPrinting" @click="printSelectedOrders" />
+                </el-tooltip>
+                <el-tooltip content="打印设置" placement="top">
+                  <el-button class="toolbar-icon-button" :icon="Setting" circle @click="printSettingsDialogVisible = true" />
+                </el-tooltip>
+                <el-tooltip content="导入Excel" placement="top">
+                  <el-button class="toolbar-icon-button" :icon="Upload" circle @click="openImportDialog('orders')" />
+                </el-tooltip>
+                <el-tooltip content="导出Excel" placement="top">
+                  <el-button class="toolbar-icon-button" :icon="Download" circle @click="exportOrdersExcel" />
+                </el-tooltip>
                 <input ref="orderFileInput" class="file-input" type="file" accept=".xlsx,.xls" @change="importOrdersExcel" />
               </div>
             </div>
@@ -2492,27 +3871,39 @@ function barWidth(value: number): string {
             </div>
             <el-table :data="pagedOrders" :height="tableHeight" row-key="id" stripe empty-text="暂无订单" @selection-change="handleOrderSelectionChange">
               <el-table-column type="selection" width="46" fixed />
-              <el-table-column prop="productName" label="产品" min-width="150" fixed />
-              <el-table-column prop="itemNo" label="货号" width="200" />
+              <el-table-column prop="orderNo" label="订单编号" min-width="260" fixed />
+              <el-table-column prop="month" label="月份" width="90" />
+              <el-table-column prop="orderTime" label="订购时间" width="120" />
               <el-table-column prop="customerUnit" label="订货单位" min-width="150" />
               <el-table-column prop="customerName" label="订货人" min-width="110" />
-              <el-table-column prop="deliveryDate" label="出库日期" width="120" />
+              <el-table-column prop="brand" label="品牌" min-width="110" />
+              <el-table-column prop="itemNo" label="货号" min-width="160" />
+              <el-table-column prop="productName" label="品名" min-width="150" />
+              <el-table-column prop="unit" label="单位" width="80" />
+              <el-table-column label="目录价" width="110"><template #default="{ row }">¥{{ formatMoney(row.catalogPrice) }}</template></el-table-column>
               <el-table-column label="数量" width="130"><template #default="{ row }">{{ formatMoney(row.quantity) }} {{ row.unit }}</template></el-table-column>
-              <el-table-column label="销售单价" width="120"><template #default="{ row }">¥{{ formatMoney(row.invoiceUnitPrice) }}</template></el-table-column>
-              <el-table-column label="成本价" width="115"><template #default="{ row }">¥{{ formatMoney(row.costUnitPrice) }}</template></el-table-column>
-              <el-table-column label="退货数量" width="120"><template #default="{ row }">{{ formatMoney(row.returnedQuantity) }} {{ row.unit }}</template></el-table-column>
-              <el-table-column label="状态" width="110">
+              <el-table-column label="开票总价" width="130"><template #default="{ row }">¥{{ formatMoney(row.invoiceTotal) }}</template></el-table-column>
+              <el-table-column label="开票情况" width="110">
                 <template #default="{ row }">
-                  <el-tag :type="currentOutboundQuantity(row) > 0 ? 'success' : 'info'" effect="light">
-                    {{ currentOutboundQuantity(row) > 0 ? '可退' : '已退完' }}
+                  <el-tag :type="row.invoiceStatus === '全部开票' ? 'success' : row.invoiceStatus === '部分开票' ? 'warning' : 'info'" effect="light">
+                    {{ row.invoiceStatus || '未开票' }}
                   </el-tag>
                 </template>
               </el-table-column>
-              <el-table-column label="当前出库" width="120"><template #default="{ row }">{{ formatMoney(currentOutboundQuantity(row)) }}</template></el-table-column>
-              <el-table-column label="销售总价" width="130"><template #default="{ row }">¥{{ formatMoney(row.invoiceTotal) }}</template></el-table-column>
-              <el-table-column label="成本总计" width="130"><template #default="{ row }">¥{{ formatMoney(row.costTotal) }}</template></el-table-column>
+              <el-table-column label="是否发货" width="100"><template #default="{ row }">{{ yesNo(row.isShipped) }}</template></el-table-column>
               <el-table-column label="返现" width="105"><template #default="{ row }">¥{{ formatMoney(row.cashback) }}</template></el-table-column>
+              <el-table-column label="成本折扣" width="105"><template #default="{ row }">{{ formatMoney(row.costDiscount) }}</template></el-table-column>
+              <el-table-column label="成本单价" width="115"><template #default="{ row }">¥{{ formatMoney(row.costUnitPrice) }}</template></el-table-column>
+              <el-table-column label="成本总价" width="130"><template #default="{ row }">¥{{ formatMoney(row.costTotal) }}</template></el-table-column>
+              <el-table-column label="售价折扣" width="105"><template #default="{ row }">{{ formatMoney(row.saleDiscount) }}</template></el-table-column>
+              <el-table-column label="开票单价" width="120"><template #default="{ row }">¥{{ formatMoney(row.invoiceUnitPrice) }}</template></el-table-column>
               <el-table-column label="毛利" width="120"><template #default="{ row }">¥{{ formatMoney(row.grossProfit) }}</template></el-table-column>
+              <el-table-column prop="remark" label="备注" min-width="150" />
+              <el-table-column prop="invoiceNo" label="发票号" min-width="160" />
+              <el-table-column label="是否回款" width="100"><template #default="{ row }">{{ yesNo(row.isPaid) }}</template></el-table-column>
+              <el-table-column prop="paidTime" label="回款时间" width="120" />
+              <el-table-column label="退货数量" width="120"><template #default="{ row }">{{ formatMoney(row.returnedQuantity) }} {{ row.unit }}</template></el-table-column>
+              <el-table-column label="当前出库" width="120"><template #default="{ row }">{{ formatMoney(currentOutboundQuantity(row)) }}</template></el-table-column>
               <el-table-column label="操作" width="175" fixed="right">
                 <template #default="{ row }">
                   <span class="table-actions">
@@ -2527,10 +3918,10 @@ function barWidth(value: number): string {
             <div class="amount-total-bar">
               <strong>金额总计</strong>
               <span>数量 {{ formatMoney(filteredOrderAmountSummary.quantity) }}</span>
-              <span>均销售单价 ¥{{ formatMoney(filteredOrderAmountSummary.averageInvoiceUnitPrice) }}</span>
-              <span>均成本价 ¥{{ formatMoney(filteredOrderAmountSummary.averageCostUnitPrice) }}</span>
-              <span>销售总价 ¥{{ formatMoney(filteredOrderAmountSummary.invoiceTotal) }}</span>
-              <span>成本总计 ¥{{ formatMoney(filteredOrderAmountSummary.costTotal) }}</span>
+              <span>均开票单价 ¥{{ formatMoney(filteredOrderAmountSummary.averageInvoiceUnitPrice) }}</span>
+              <span>均成本单价 ¥{{ formatMoney(filteredOrderAmountSummary.averageCostUnitPrice) }}</span>
+              <span>开票总价 ¥{{ formatMoney(filteredOrderAmountSummary.invoiceTotal) }}</span>
+              <span>成本总价 ¥{{ formatMoney(filteredOrderAmountSummary.costTotal) }}</span>
               <span>返现 ¥{{ formatMoney(filteredOrderAmountSummary.cashback) }}</span>
               <span>毛利 ¥{{ formatMoney(filteredOrderAmountSummary.grossProfit) }}</span>
             </div>
@@ -2546,6 +3937,64 @@ function barWidth(value: number): string {
           </div>
         </section>
 
+        <section v-if="activePage === 'invoices'" class="page-stack">
+          <div class="panel table-panel">
+            <div class="panel-head">
+              <h2>发票管理</h2>
+              <div class="panel-actions">
+                <el-input v-model="invoiceQuery" class="search-input" :prefix-icon="Search" clearable placeholder="发票号、出库单、客户、产品编号、备注" />
+                <el-date-picker v-model="invoiceDateRange" class="range-input" type="daterange" value-format="YYYY-MM-DD" range-separator="至" start-placeholder="开始日期" end-placeholder="结束日期" />
+                <el-tooltip content="生成发票" placement="top">
+                  <el-button class="toolbar-icon-button" type="primary" :icon="DocumentAdd" circle :disabled="selectedOrders.length === 0" @click="openInvoiceCreateFromSelectedOrders" />
+                </el-tooltip>
+                <el-tooltip content="导出Excel" placement="top">
+                  <el-button class="toolbar-icon-button" :icon="Download" circle @click="exportInvoicesExcel" />
+                </el-tooltip>
+              </div>
+            </div>
+            <div class="summary-strip">
+              <span>全部 {{ data.invoices.length }}</span>
+              <span>显示 {{ filteredInvoices.length }}</span>
+              <span>发票总额 ¥{{ formatMoney(invoiceTotalAmount) }}</span>
+              <span>当前筛选 ¥{{ formatMoney(filteredInvoiceTotalAmount) }}</span>
+            </div>
+            <el-table :data="pagedInvoices" :height="tableHeight" row-key="id" stripe empty-text="暂无发票">
+              <el-table-column label="发票号" min-width="220" fixed>
+                <template #default="{ row }">
+                  <span class="table-link" @click="openOrdersForInvoice(row)">{{ row.invoiceNo }}</span>
+                </template>
+              </el-table-column>
+              <el-table-column prop="invoiceDate" label="开票日期" width="120" />
+              <el-table-column label="开票总额" width="130"><template #default="{ row }">¥{{ formatMoney(row.totalAmount) }}</template></el-table-column>
+              <el-table-column label="是否回款" width="100"><template #default="{ row }">{{ yesNo(row.isPaid) }}</template></el-table-column>
+              <el-table-column prop="paidTime" label="回款时间" width="120" />
+              <el-table-column label="关联出库单" min-width="320">
+                <template #default="{ row }">
+                  {{ formatInvoiceLineSummary(row.lines) }}
+                </template>
+              </el-table-column>
+              <el-table-column prop="remark" label="备注" min-width="160" />
+              <el-table-column label="操作" width="120" fixed="right">
+                <template #default="{ row }">
+                  <span class="table-actions">
+                    <span class="table-action" @click="editInvoice(row)">编辑</span>
+                    <span class="table-action danger" @click="deleteInvoice(row)">删除</span>
+                  </span>
+                </template>
+              </el-table-column>
+            </el-table>
+            <div class="pagination-bar">
+              <el-pagination
+                v-model:current-page="invoicePage"
+                v-model:page-size="invoicePageSize"
+                :total="filteredInvoices.length"
+                background
+                layout="total, prev, pager, next"
+              />
+            </div>
+          </div>
+        </section>
+
         <section v-if="activePage === 'returns'" class="page-stack">
           <div class="panel table-panel">
             <div class="panel-head">
@@ -2553,9 +4002,15 @@ function barWidth(value: number): string {
               <div class="panel-actions">
                 <el-input v-model="returnQuery" class="search-input" :prefix-icon="Search" clearable placeholder="产品、货号、单位、订货人" />
                 <el-date-picker v-model="returnDateRange" class="range-input" type="daterange" value-format="YYYY-MM-DD" range-separator="至" start-placeholder="开始日期" end-placeholder="结束日期" />
-                <el-button type="primary" :icon="Plus" @click="openReturnCreate">新增退货</el-button>
-                <el-button :icon="Upload" @click="openImportDialog('returns')">导入Excel</el-button>
-                <el-button :icon="Download" @click="exportReturnsExcel">导出Excel</el-button>
+                <el-tooltip content="新增退货" placement="top">
+                  <el-button class="toolbar-icon-button" type="primary" :icon="Plus" circle @click="openReturnCreate" />
+                </el-tooltip>
+                <el-tooltip content="导入Excel" placement="top">
+                  <el-button class="toolbar-icon-button" :icon="Upload" circle @click="openImportDialog('returns')" />
+                </el-tooltip>
+                <el-tooltip content="导出Excel" placement="top">
+                  <el-button class="toolbar-icon-button" :icon="Download" circle @click="exportReturnsExcel" />
+                </el-tooltip>
                 <input ref="returnFileInput" class="file-input" type="file" accept=".xlsx,.xls" @change="importReturnsExcel" />
               </div>
             </div>
@@ -2766,7 +4221,7 @@ function barWidth(value: number): string {
 
         <el-dialog
           v-model="orderDialogVisible"
-          :title="editingOrderId ? '编辑订单' : '新增订单'"
+          :title="editingOrderId ? '编辑出库单' : '新增出库单'"
           width="min(980px, calc(100vw - 32px))"
           class="form-dialog"
           destroy-on-close
@@ -2784,29 +4239,122 @@ function barWidth(value: number): string {
               </el-select>
             </el-form-item>
             <div class="form-grid">
-              <el-form-item label="产品名称"><el-input v-model="orderForm.productName" /></el-form-item>
+              <el-form-item label="订单编号"><el-input v-model="orderForm.orderNo" placeholder="留空自动生成" /></el-form-item>
+              <el-form-item label="月份"><el-input v-model="orderForm.month" readonly /></el-form-item>
+              <el-form-item label="品名"><el-input v-model="orderForm.productName" /></el-form-item>
               <el-form-item label="货号"><el-input v-model="orderForm.itemNo" /></el-form-item>
               <el-form-item label="订购时间"><el-date-picker v-model="orderForm.orderTime" type="date" value-format="YYYY-MM-DD" /></el-form-item>
-              <el-form-item label="出库日期"><el-date-picker v-model="orderForm.deliveryDate" type="date" value-format="YYYY-MM-DD" /></el-form-item>
               <el-form-item label="订货单位"><el-input v-model="orderForm.customerUnit" /></el-form-item>
               <el-form-item label="订货人"><el-input v-model="orderForm.customerName" /></el-form-item>
               <el-form-item label="品牌"><el-input v-model="orderForm.brand" /></el-form-item>
               <el-form-item label="单位"><el-input v-model="orderForm.unit" /></el-form-item>
               <el-form-item label="目录价"><el-input v-model="orderForm.catalogPrice" /></el-form-item>
               <el-form-item label="数量"><el-input v-model="orderForm.quantity" /></el-form-item>
-              <el-form-item label="销售单价"><el-input v-model="orderForm.invoiceUnitPrice" /></el-form-item>
+              <el-form-item label="开票单价"><el-input v-model="orderForm.invoiceUnitPrice" /></el-form-item>
               <el-form-item label="成本单价"><el-input v-model="orderForm.costUnitPrice" /></el-form-item>
-              <el-form-item label="销售总价"><el-input v-model="orderForm.invoiceTotal" readonly /></el-form-item>
+              <el-form-item label="开票总价"><el-input v-model="orderForm.invoiceTotal" readonly /></el-form-item>
               <el-form-item label="成本总价"><el-input v-model="orderForm.costTotal" readonly /></el-form-item>
               <el-form-item label="返现"><el-input v-model="orderForm.cashback" /></el-form-item>
+              <el-form-item label="成本折扣"><el-input v-model="orderForm.costDiscount" /></el-form-item>
+              <el-form-item label="售价折扣"><el-input v-model="orderForm.saleDiscount" /></el-form-item>
               <el-form-item label="毛利"><el-input v-model="orderForm.grossProfit" readonly /></el-form-item>
+              <el-form-item label="开票情况"><el-input v-model="orderForm.invoiceStatus" readonly /></el-form-item>
+              <el-form-item label="发票号"><el-input v-model="orderForm.invoiceNo" disabled /></el-form-item>
+              <el-form-item label="是否发货"><el-switch v-model="orderForm.isShipped" active-text="是" inactive-text="否" /></el-form-item>
+              <el-form-item label="是否回款"><el-switch v-model="orderForm.isPaid" disabled active-text="是" inactive-text="否" /></el-form-item>
+              <el-form-item label="回款时间"><el-date-picker v-model="orderForm.paidTime" type="date" value-format="YYYY-MM-DD" disabled /></el-form-item>
             </div>
             <el-form-item label="备注"><el-input v-model="orderForm.remark" type="textarea" :rows="3" /></el-form-item>
           </el-form>
           <template #footer>
             <div class="dialog-actions">
               <el-button @click="resetOrderForm">取消</el-button>
-              <el-button type="primary" :icon="Plus" @click="saveOrder">保存订单</el-button>
+              <el-button type="primary" :icon="Plus" @click="saveOrder">保存出库单</el-button>
+            </div>
+          </template>
+        </el-dialog>
+
+        <el-dialog
+          v-model="invoiceDialogVisible"
+          :title="editingInvoiceId ? '编辑发票' : '生成发票'"
+          width="min(1080px, calc(100vw - 32px))"
+          class="form-dialog"
+          destroy-on-close
+          @closed="resetInvoiceForm"
+        >
+          <el-form label-position="top">
+            <div class="form-grid">
+              <el-form-item label="发票号"><el-input v-model="invoiceForm.invoiceNo" /></el-form-item>
+              <el-form-item label="开票日期"><el-date-picker v-model="invoiceForm.invoiceDate" type="date" value-format="YYYY-MM-DD" /></el-form-item>
+              <el-form-item label="是否回款"><el-switch v-model="invoiceForm.isPaid" active-text="是" inactive-text="否" /></el-form-item>
+              <el-form-item label="回款时间"><el-date-picker v-model="invoiceForm.paidTime" type="date" value-format="YYYY-MM-DD" :disabled="!invoiceForm.isPaid" /></el-form-item>
+            </div>
+            <div class="batch-line-head">
+              <strong>出库单明细</strong>
+              <span>累计 ¥{{ formatMoney(invoiceFormTotalAmount) }}</span>
+            </div>
+            <el-table :data="invoiceForm.lines" class="batch-line-table" max-height="420" stripe empty-text="请从出库单列表多选后生成发票">
+              <el-table-column prop="orderNo" label="订单编号" min-width="280" fixed />
+              <el-table-column prop="customerUnit" label="订货单位" min-width="150" />
+              <el-table-column prop="productName" label="品名" min-width="150" />
+              <el-table-column prop="itemNo" label="货号" min-width="140" />
+              <el-table-column label="出库单金额" width="130"><template #default="{ row }">¥{{ formatMoney(row.orderAmount) }}</template></el-table-column>
+              <el-table-column label="本次发票金额" width="160">
+                <template #default="{ row }"><el-input-number v-model="row.invoiceAmount" :min="0" :precision="2" :step="100" controls-position="right" /></template>
+              </el-table-column>
+              <el-table-column label="操作" width="76" fixed="right">
+                <template #default="{ row }">
+                  <span class="table-action danger" @click="removeInvoiceLine(row.id)">移除</span>
+                </template>
+              </el-table-column>
+            </el-table>
+            <el-form-item label="备注"><el-input v-model="invoiceForm.remark" type="textarea" :rows="3" /></el-form-item>
+          </el-form>
+          <template #footer>
+            <div class="dialog-actions">
+              <el-button @click="resetInvoiceForm">取消</el-button>
+              <el-button type="primary" :icon="DocumentAdd" @click="saveInvoice">保存发票</el-button>
+            </div>
+          </template>
+        </el-dialog>
+
+        <el-dialog
+          v-model="printSettingsDialogVisible"
+          title="打印设置"
+          width="min(680px, calc(100vw - 32px))"
+          class="form-dialog"
+        >
+          <el-form label-position="top">
+            <div class="form-grid print-settings-grid">
+              <el-form-item label="出库单打印方式">
+                <el-select v-model="printProfileKey" class="print-profile-select" size="default">
+                  <el-option v-for="profile in PRINT_PROFILES" :key="profile.key" :label="profile.label" :value="profile.key" />
+                </el-select>
+              </el-form-item>
+              <el-form-item label="单据编号前缀">
+                <el-input v-model="printContentSettings.orderNoPrefix" placeholder="例如 No:" />
+              </el-form-item>
+              <el-form-item label="公司名称" class="form-item-wide">
+                <el-input v-model="printContentSettings.companyName" placeholder="打印抬头公司名称" />
+              </el-form-item>
+              <el-form-item label="单据名称">
+                <el-input v-model="printContentSettings.documentTitle" placeholder="例如 送（销）货单" />
+              </el-form-item>
+              <el-form-item label="出货仓">
+                <el-input v-model="printContentSettings.warehouseName" placeholder="例如 普通舱" />
+              </el-form-item>
+              <el-form-item label="签字栏标题">
+                <el-input v-model="printContentSettings.receiverSignatureLabel" placeholder="例如 收货人签名:" />
+              </el-form-item>
+              <el-form-item label="签字栏说明">
+                <el-input v-model="printContentSettings.receiverSignatureHint" placeholder="例如 （“货物”“发票”已收到）" />
+              </el-form-item>
+            </div>
+          </el-form>
+          <template #footer>
+            <div class="dialog-actions">
+              <el-button @click="resetPrintContentSettings">恢复默认</el-button>
+              <el-button type="primary" @click="printSettingsDialogVisible = false">完成</el-button>
             </div>
           </template>
         </el-dialog>

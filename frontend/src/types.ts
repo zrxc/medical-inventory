@@ -4,6 +4,7 @@ export interface AppData {
   products: Product[]
   customers: Customer[]
   orders: Order[]
+  invoices: Invoice[]
   returns: ReturnRecord[]
 }
 
@@ -31,8 +32,10 @@ export interface Product {
 
 export interface Order {
   id: string
+  orderNo: string
   productId: string | null
   customerId: string | null
+  month: string
   productName: string
   itemNo: string
   orderTime: string
@@ -44,6 +47,8 @@ export interface Order {
   catalogPrice: number
   quantity: number
   invoiceTotal: number
+  invoiceStatus: string
+  isShipped: boolean
   cashback: number
   costDiscount: number
   costUnitPrice: number
@@ -52,8 +57,34 @@ export interface Order {
   invoiceUnitPrice: number
   grossProfit: number
   remark: string
+  invoiceNo: string
+  isPaid: boolean
   paidTime: string
   returnedQuantity: number
+  createdAt: string
+}
+
+export interface InvoiceLine {
+  id: string
+  orderId: string
+  orderNo: string
+  productName: string
+  itemNo: string
+  customerUnit: string
+  customerName: string
+  orderAmount: number
+  invoiceAmount: number
+}
+
+export interface Invoice {
+  id: string
+  invoiceNo: string
+  invoiceDate: string
+  isPaid: boolean
+  paidTime: string
+  totalAmount: number
+  remark: string
+  lines: InvoiceLine[]
   createdAt: string
 }
 
@@ -94,8 +125,10 @@ export interface ProductForm {
 }
 
 export interface OrderForm {
+  orderNo: string
   productId: string | null
   customerId: string | null
+  month: string
   productName: string
   itemNo: string
   orderTime: string
@@ -107,6 +140,8 @@ export interface OrderForm {
   catalogPrice: string
   quantity: string
   invoiceTotal: string
+  invoiceStatus: string
+  isShipped: boolean
   cashback: string
   costDiscount: string
   costUnitPrice: string
@@ -115,6 +150,8 @@ export interface OrderForm {
   invoiceUnitPrice: string
   grossProfit: string
   remark: string
+  invoiceNo: string
+  isPaid: boolean
   paidTime: string
 }
 
